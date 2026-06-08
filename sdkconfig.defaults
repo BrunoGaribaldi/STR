@@ -1,0 +1,34 @@
+# ============================================================================
+#  sdkconfig.defaults
+#  Opciones relevantes para este proyecto. ESP-IDF generara el 'sdkconfig'
+#  real a partir de estos valores la primera vez que se compile/configure.
+#  Tambien se pueden ajustar con: idf.py menuconfig
+# ============================================================================
+
+# --- Consola serie a 115200 baudios (puerto de monitoreo) ---
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# --- Frecuencia de tick de FreeRTOS a 1000 Hz (resolucion de 1 ms) ---
+# Util para que pdMS_TO_TICKS y los periodos de 20/200 ms sean precisos.
+CONFIG_FREERTOS_HZ=1000
+
+# --- Permitir la ISR de GPIO en IRAM (recomendado para latencia baja) ---
+CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y
+
+# --- Log level por defecto en INFO (ESP_LOGI visible) ---
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# --- Tamano de flash real del modulo (este ESP32 trae 2 MB) ---
+CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+
+# --- Silenciar el aviso EOL del driver I2C legacy (driver/i2c.h) ---
+# Este proyecto usa la API I2C legacy (i2c_master_write/read) tal como se pidio.
+# En ESP-IDF v6.0 sigue presente pero marcada EOL; esta opcion oculta el aviso.
+CONFIG_I2C_SUPPRESS_DEPRECATE_WARN=y
+
+# NOTA SOBRE EL DRIVER MCPWM:
+#   El driver legacy "driver/mcpwm.h" fue ELIMINADO en ESP-IDF v6.0, por eso
+#   servos.c usa la API nueva basada en handles (driver/mcpwm_prelude.h):
+#   timer -> operator -> comparator -> generator. El comportamiento (50 Hz,
+#   pulsos en us) es identico al solicitado.
