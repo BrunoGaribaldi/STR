@@ -2,6 +2,7 @@
  *  tasks.h
  *  Declaracion de las tareas FreeRTOS, la ISR y los objetos de sincronizacion
  *  compartidos del sistema de control de vuelo.
+ *  MATERIAL DE ESTUDIO -> [Guia §IV.2] (las tareas) y [Guia §II.6] (sincronizacion).
  * ==========================================================================*/
 
 #ifndef TASKS_H
@@ -11,7 +12,9 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
-/* Struct compartida con los angulos filtrados publicados por el sensor. */
+/* Struct que viaja por la cola: los angulos filtrados que publica el sensor.
+ * Una cola transporta elementos de tamano fijo; aca es un struct porque
+ * mandamos dos valores juntos (roll y pitch) como una unidad. [Guia §II.6.c] */
 typedef struct {
     float roll;
     float pitch;

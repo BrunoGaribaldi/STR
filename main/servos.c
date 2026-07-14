@@ -1,9 +1,10 @@
 /* ============================================================================
- *  servos.c
+ *  servos.c                                                    [Guia §II.9.c]
  *  Control de servos por MCPWM usando el driver NUEVO de ESP-IDF v5/v6
  *  (driver/mcpwm_prelude.h). El driver legacy "driver/mcpwm.h" fue eliminado
  *  en ESP-IDF v6.0, por eso se usa la API basada en handles:
  *      timer -> operator -> comparator -> generator
+ *  (Que hace cada eslabon esta explicado en [Guia §II.9.c].)
  *
  *  Configuracion: resolucion de 1 us/tick, periodo de 20000 ticks = 20 ms
  *  (50 Hz). El ancho de pulso en microsegundos coincide 1:1 con el valor de
@@ -123,7 +124,8 @@ esp_err_t servos_init(void)
 
 void servos_set_us(uint32_t servo1_us, uint32_t servo2_us)
 {
-    /* Cambiar el valor de comparacion = cambiar el ancho de pulso (us) */
+    /* Mover un servo = cambiar el valor del comparador = cambiar el ancho del
+     * pulso (us). El timer y el generador siguen solos, sin CPU. [Guia §II.9.c] */
     mcpwm_comparator_set_compare_value(s_cmp1, clamp_us(servo1_us));
     mcpwm_comparator_set_compare_value(s_cmp2, clamp_us(servo2_us));
 }

@@ -1,6 +1,6 @@
 /* ============================================================================
  *  mpu6050.h
- *  Driver I2C del sensor inercial MPU6050.
+ *  Driver I2C del sensor inercial MPU6050.  ->  [Guia §II.9.a] y [Guia §III.2]
  *  Expone funciones para inicializar el bus, despertar el sensor y leer
  *  acelerometro + giroscopio ya escalados a unidades fisicas.
  * ==========================================================================*/

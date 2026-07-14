@@ -1,6 +1,7 @@
 /* ============================================================================
  *  servos.h
  *  Control de los dos servos de los alerones mediante el modulo MCPWM.
+ *  MATERIAL DE ESTUDIO -> [Guia §II.9.c] (que es PWM/MCPWM y como mueve el servo).
  * ==========================================================================*/
 
 #ifndef SERVOS_H

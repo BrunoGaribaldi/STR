@@ -1,6 +1,14 @@
 /* ============================================================================
- *  tasks.c
+ *  tasks.c   <<< ARCHIVO CLAVE DEL PROYECTO >>>
  *  Implementa las 3 tareas FreeRTOS + la ISR del pulsador.
+ *
+ *  MATERIAL DE ESTUDIO: es el nucleo del sistema. Referencias a la guia:
+ *    - Tareas, prioridades, planificador ....... [Guia §II.4]
+ *    - Interrupciones / ISR / antirrebote ...... [Guia §II.5]
+ *    - Sincronizacion (mutex, spinlock, cola) .. [Guia §II.6]
+ *    - Filtro complementario ................... [Guia §II.8]
+ *    - Control proporcional .................... [Guia §IV.3]
+ *    - Recorrido completo de un dato ........... [Guia §V]
  *
  *  Arquitectura:
  *    task_sensor   (prio MEDIA) -> lee MPU6050 @50Hz, filtra, publica en cola.
@@ -8,8 +16,8 @@
  *    task_monitor  (prio BAJA)  -> imprime estado por puerto serie cada 200ms.
  *    gpio_isr_handler (ISR)     -> al pulsar, solicita fijar nuevo punto cero.
  *
- *  CONTROL DE UN SOLO EJE: el actuador corrige el eje seleccionado en config.h
- *  (ROLL por defecto). El otro eje se monitorea pero no genera correccion.
+ *  CONTROL DE UN SOLO EJE: el actuador corrige ROLL (alabeo). El PITCH se mide
+ *  y se reporta, pero no genera correccion (ver [Guia §VI.2]).
  * ==========================================================================*/
 
 #include "tasks.h"
@@ -28,19 +36,25 @@
 #define RAD_TO_DEG (57.2957795f)   /* 180/PI */
 
 /* ---------------------------------------------------------------------------
- *  Objetos de sincronizacion globales
+ *  Objetos de sincronizacion globales                         [Guia §II.6]
+ *  Como las tareas comparten memoria, hay que protegerse de "condiciones de
+ *  carrera" (dos tareas tocando lo mismo a la vez). Usamos 3 mecanismos:
+ *    - imu_queue : COLA, pasa el angulo del sensor al actuador [Guia §II.6.c]
+ *    - zero_mutex: MUTEX, protege el punto cero (entre tareas) [Guia §II.6.b]
+ *    - isr_mux   : SPINLOCK, protege lo que comparte con la ISR [Guia §II.6.a]
  * ------------------------------------------------------------------------- */
-QueueHandle_t     imu_queue   = NULL;
-SemaphoreHandle_t zero_mutex  = NULL;
+QueueHandle_t     imu_queue   = NULL;   /* [Guia §II.6.c] cola productor->consumidor */
+SemaphoreHandle_t zero_mutex  = NULL;   /* [Guia §II.6.b] protege el punto cero       */
 
 /* Punto cero logico (referencia de nivelado). Protegido por zero_mutex. */
 static float zero_roll  = 0.0f;
 static float zero_pitch = 0.0f;
 
 /* ---------------------------------------------------------------------------
- *  Datos compartidos entre la ISR y la tarea sensor.
- *  La ISR no puede tomar mutex, asi que se usa una seccion critica con spinlock
- *  para leer/escribir estas variables de forma atomica.
+ *  Datos compartidos entre la ISR y la tarea sensor.          [Guia §II.6.a]
+ *  La ISR no puede tomar un mutex (bloquearia); ademas el ESP32 es dual-core.
+ *  Por eso se usa un SPINLOCK (seccion critica) para leer/escribir estas
+ *  variables de forma atomica, tanto desde la ISR como desde la tarea.
  * ------------------------------------------------------------------------- */
 static portMUX_TYPE isr_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool  zero_reset_requested = false; /* flag puesto por la ISR */
@@ -60,9 +74,13 @@ static const char *TAG_MON    = "MONITOR";
 static const char *TAG_ISR    = "ISR";
 
 /* ===========================================================================
- *  ISR DEL PULSADOR (GPIO19, flanco de BAJADA - ver GPIO_INTR_NEGEDGE abajo)
- *  Antirrebote por software de 300 ms. Solo levanta una bandera; el trabajo
- *  real (fijar el cero) lo hace la tarea sensor, que es quien conoce el angulo.
+ *  ISR DEL PULSADOR (GPIO19, flanco de BAJADA)                [Guia §II.5]
+ *  Una ISR es una funcion que dispara el HARDWARE al ocurrir un evento (aca,
+ *  el flanco del boton). Debe ser CORTISIMA: no imprime, no bloquea. Solo hace
+ *  "trabajo diferido": levanta una bandera y termina; el trabajo real (fijar el
+ *  cero) lo hace despues la tarea sensor, que es quien conoce el angulo.
+ *  - IRAM_ATTR: pone la ISR en RAM interna -> latencia minima y predecible.
+ *  - Antirrebote (debounce) 300 ms: ignora rebotes del boton. [Guia §II.5]
  * ==========================================================================*/
 static void IRAM_ATTR gpio_isr_handler(void *arg)
 {
@@ -77,7 +95,9 @@ static void IRAM_ATTR gpio_isr_handler(void *arg)
 }
 
 /* ===========================================================================
- *  TAREA PRODUCTORA: lectura del IMU + filtro complementario (1 eje activo)
+ *  TAREA PRODUCTORA (prio MEDIA=5): lee el IMU, filtra y publica en la cola.
+ *  Corre exactamente a 50 Hz (ver vTaskDelayUntil al final del bucle).
+ *  Es el "Paso 2 a 6" del recorrido de datos de [Guia §V].
  * ==========================================================================*/
 static void task_sensor(void *arg)
 {
@@ -93,14 +113,18 @@ static void task_sensor(void *arg)
 
     for (;;) {
         if (mpu6050_read(&r) == ESP_OK) {
-            /* Angulos por acelerometro (gravedad) usando atan2 */
+            /* [Guia §V Paso 4] Angulo por ACELEROMETRO usando la gravedad.
+             * atan2 deduce la inclinacion a partir de los componentes del
+             * vector gravedad. Es exacto pero RUIDOSO (lo ensucia la vibracion). */
             float accel_roll  = atan2f(r.acc_y, r.acc_z) * RAD_TO_DEG;
             float accel_pitch = atan2f(-r.acc_x,
                                        sqrtf(r.acc_y * r.acc_y + r.acc_z * r.acc_z))
                                 * RAD_TO_DEG;
 
-            /* Filtro complementario:
+            /* [Guia §II.8] FILTRO COMPLEMENTARIO (el "cerebro" del procesamiento).
              * angle = 0.98*(angle + gyro*dt) + 0.02*accel_angle
+             *   98% GIROSCOPIO -> rapido y sin vibracion, pero derivaria (drift).
+             *    2% ACELEROMETRO -> ancla a la gravedad real y borra el drift.
              * Para roll integra gyro_x; para pitch integra gyro_y. */
             roll  = COMP_ALPHA * (roll  + r.gyro_x * SENSOR_DT_S)
                     + (1.0f - COMP_ALPHA) * accel_roll;
@@ -132,7 +156,9 @@ static void task_sensor(void *arg)
                 }
             }
 
-            /* Publicar los angulos filtrados en la cola */
+            /* [Guia §II.6.c] Publicar los angulos en la COLA (por copia).
+             * El "0" = no esperar: si la cola esta llena (actuador atrasado),
+             * se DESCARTA la muestra para no frenar el ritmo de 50 Hz. */
             imu_data_t data = { .roll = roll, .pitch = pitch };
             if (xQueueSend(imu_queue, &data, 0) != pdTRUE) {
                 ESP_LOGW(TAG_SENSOR, "Cola llena, muestra descartada");
@@ -141,14 +167,19 @@ static void task_sensor(void *arg)
             ESP_LOGE(TAG_SENSOR, "Fallo de lectura I2C del MPU6050");
         }
 
-        /* Muestreo periodico exacto a 50 Hz */
+        /* [Guia §II.4] Muestreo periodico EXACTO a 50 Hz. vTaskDelayUntil
+         * despierta en instantes absolutos (20,40,60 ms...), sin acumular
+         * deriva aunque la lectura tarde distinto cada vez. */
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SENSOR_PERIOD_MS));
     }
 }
 
 /* ===========================================================================
- *  TAREA CONSUMIDORA / ACTUACION: calcula correccion y mueve servos.
- *  No usa vTaskDelay: bloquea en la cola con timeout como mecanismo de espera.
+ *  TAREA CONSUMIDORA / ACTUACION (prio ALTA=7).    [Guia §II.6.c y §IV.3]
+ *  Calcula la correccion y mueve los servos. Es el "Paso 7 a 10" de [Guia §V].
+ *  NO usa vTaskDelay: se BLOQUEA en la cola (la cola es su "reloj"). Al llegar
+ *  un dato se despierta y, por tener MAS prioridad que el sensor, lo desaloja
+ *  para corregir de inmediato (preemption, [Guia §II.4]).
  * ==========================================================================*/
 static void task_actuator(void *arg)
 {
@@ -171,18 +202,19 @@ static void task_actuator(void *arg)
                 ESP_LOGW(TAG_ACT, "Timeout tomando zero_mutex");
             }
 
-            /* Error de ALABEO respecto al punto cero.
+            /* [Guia §IV.3] CONTROL PROPORCIONAL (P).
+             * error = cuanto se desvio del "nivelado" (punto cero).
              * (El pitch se mide y se reporta, pero no genera correccion.) */
             float error_roll = data.roll - z_roll;
 
-            /* Partimos del neutro fisico de cada servo y aplicamos la
-             * correccion de roll segun el sentido de cada servo
-             * (SERVO1_DIR / SERVO2_DIR en config.h). En este montaje ambos
-             * van con el mismo signo (Servo2 estaba invertido). */
+            /* Partimos del neutro fisico de cada servo y sumamos una correccion
+             * PROPORCIONAL al error (CONTROL_GAIN = us por grado). El signo
+             * SERVOx_DIR ajusta el sentido segun el montaje. [Guia §II.9.c] */
             float s1 = (float)SERVO1_ZERO_US + SERVO1_DIR * error_roll * CONTROL_GAIN;
             float s2 = (float)SERVO2_ZERO_US + SERVO2_DIR * error_roll * CONTROL_GAIN;
 
-            /* Limitar al rango seguro [1000, 2000] us */
+            /* Saturacion (clamping): nunca fuera de [1000,2000] us, o se dana el
+             * servo. Es el "Paso 9" de [Guia §V]. */
             if (s1 < SERVO_MIN_US) s1 = SERVO_MIN_US;
             if (s1 > SERVO_MAX_US) s1 = SERVO_MAX_US;
             if (s2 < SERVO_MIN_US) s2 = SERVO_MIN_US;
@@ -206,7 +238,10 @@ static void task_actuator(void *arg)
 }
 
 /* ===========================================================================
- *  TAREA DE MONITOREO: imprime estado por serie cada 200 ms.
+ *  TAREA DE MONITOREO (prio BAJA=3).                          [Guia §II.9.b]
+ *  Imprime el estado por el PUERTO SERIE (UART) cada 200 ms con ESP_LOGI.
+ *  Cada 200 ms (no mas seguido) porque es comodo de leer y no debe molestar al
+ *  control; por ser la de menor prioridad, corre solo en los ratos libres.
  * ==========================================================================*/
 static void task_monitor(void *arg)
 {
@@ -242,7 +277,9 @@ static void task_monitor(void *arg)
 }
 
 /* ===========================================================================
- *  INICIALIZACION DE SINCRONIZACION + ISR
+ *  INICIALIZACION DE SINCRONIZACION + ISR       [Guia §II.6 y §II.5]
+ *  Crea la cola y el mutex, configura el GPIO del boton e instala su ISR.
+ *  Se llama desde app_main ANTES de crear las tareas.
  * ==========================================================================*/
 void tasks_sync_init(void)
 {
@@ -255,8 +292,8 @@ void tasks_sync_init(void)
     configASSERT(zero_mutex != NULL);
 
     /* --- Configurar el pulsador GPIO19 como entrada con pull-UP e ISR ---
-     * Pulsador clasico de 4 patas cableado a GND:
-     *   reposo -> pull-up mantiene la linea en ALTO (1)
+     * [Guia §II.5 y §III.4] Pulsador tratado como contacto a GND (activo-bajo):
+     *   reposo -> el pull-up interno mantiene la linea en ALTO (1)
      *   al apretar -> conecta a GND -> linea en BAJO (0) -> flanco de BAJADA */
     gpio_config_t io = {
         .pin_bit_mask = (1ULL << BUTTON_GPIO),
@@ -276,7 +313,10 @@ void tasks_sync_init(void)
 }
 
 /* ===========================================================================
- *  CREACION DE LAS TAREAS
+ *  CREACION DE LAS TAREAS                                     [Guia §II.4]
+ *  xTaskCreate(funcion, nombre, stack_en_words, param, PRIORIDAD, handle).
+ *  No usamos xTaskCreatePinnedToCore: dejamos que FreeRTOS reparta en los 2
+ *  nucleos. Las prioridades (5/7/3) estan en config.h.
  * ==========================================================================*/
 void tasks_start(void)
 {

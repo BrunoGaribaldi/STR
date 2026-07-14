@@ -1,675 +1,1228 @@
-# Resumen Integral para la Defensa — Controlador de Vuelo en Tiempo Real (Ala Volante)
+# Guía de Estudio Integral — Controlador de Vuelo en Tiempo Real (Ala Volante)
 
-> **Propósito de este documento:** guía de estudio para presentar el proyecto ante el profesor.
-> Explica *qué* hace cada parte, *por qué* se decidió así, y *contrasta* la implementación real
-> con (a) lo visto en clases/laboratorios y (b) lo prometido en el Anteproyecto y en `DOCUMENTACION.md`.
->
-> **Fuentes de verdad usadas:** el código en `main/`, el `Anteproyecto - STR.pdf` y el material de
-> `Clases/`. Donde el código y los documentos difieren, se marca explícitamente.
+> **Qué es este documento.** Un material de estudio **completo y desde cero** para rendir el examen.
+> No supone que ya sabés de sistemas embebidos: cada concepto se explica desde su raíz (qué es, por qué
+> existe, cómo se usa en *nuestro* proyecto y dónde lo vimos en la cursada). Si un término aparece por
+> primera vez, se define. Leelo de arriba hacia abajo la primera vez; después usá el índice para repasar.
 >
 > **Materia:** Sistemas en Tiempo Real — Ing. Informática · IUA · Grupo 5
 > (Rodeyro, Macedo Rodriguez, Garibaldi, Bertorello) · 2026
 
 ---
 
-## 0. TL;DR — Lo que tenés que poder decir en 60 segundos
+## Cómo está organizado
 
-Es un **controlador de estabilización activa de lazo cerrado** para un avión *ala volante*, corriendo
-sobre un **ESP32** con el RTOS **FreeRTOS**. Un sensor inercial **MPU6050** se lee por **I2C a 50 Hz**;
-sus datos se **fusionan con un filtro complementario** (giroscopio + acelerómetro) para obtener el
-ángulo de inclinación limpio; una **tarea productora** publica ese ángulo en una **cola de FreeRTOS**;
-una **tarea actuadora de mayor prioridad** lo consume, calcula un **control proporcional** y mueve
-**dos servos SG90** vía **MCPWM**. Un **sensor táctil (GPIO con ISR)** permite fijar el "punto cero"
-en caliente. Una **tarea de monitor** imprime el estado por puerto serie cada 200 ms. El requisito de
-tiempo real es que **entre medir y corregir pase ≤ 20 ms**.
+- **PARTE I — El proyecto en criollo:** qué problema resuelve y la idea de la solución, sin tecnicismos.
+- **PARTE II — Conceptos desde cero:** toda la teoría que necesitás (RTOS, tareas, interrupciones,
+  sincronización, señales, filtros, I2C, PWM, puerto serie). Acá están respondidas **tus 8 preguntas**.
+- **PARTE III — El hardware pieza por pieza.**
+- **PARTE IV — El software:** archivos, tareas, parámetros, guía de lectura.
+- **PARTE V — Recorrido paso a paso** de un dato, reexplicado para que se entienda.
+- **PARTE VI — Contexto académico:** qué vimos en clase, qué cambió respecto al anteproyecto, build system.
+- **PARTE VII — Profundización:** detalles finos que dan puntos extra (I2C byte a byte, stacks, IRAM,
+  glitches de PWM, robustez) y cómo compilar/flashear/monitorear en la práctica.
+- **PARTE VIII — Repaso:** preguntas probables del profesor y glosario.
 
----
+> A lo largo del texto vas a ver cajas **❓ Tu pregunta** que responden exactamente lo que preguntaste.
 
-## A. Guía de lectura del código (por dónde empezar)
-
-El proyecto son **5 módulos**. Leelos **en este orden** — está pensado para ir de lo simple a lo
-complejo, de modo que cuando llegues al archivo importante (`tasks.c`) ya entiendas todo lo que usa.
-
-| Orden | Archivo | Qué mirar | Tiempo | Prioridad |
-|:---:|---|---|:---:|:---:|
-| 1️⃣ | **`config.h`** | Tu "tablero de control". Leelo entero: pines, escalas del sensor, rango de servos, `CONTROL_GAIN=10`, `COMP_ALPHA=0.98`, prioridades (5/7/3), tamaños de stack. No hay lógica, solo números. | 5 min | ⭐⭐⭐ |
-| 2️⃣ | **`main.c`** | El **arranque**. Solo tiene `app_main()` con los 5 pasos de inicialización en orden. Es el "esqueleto" del sistema. Corto (~40 líneas). | 3 min | ⭐⭐ |
-| 3️⃣ | **`mpu6050.c`** (+`.h`) | Cómo se **lee el sensor** por I2C: `mpu6050_read()` trae 14 bytes, los reconstruye (big-endian) y los escala a *g* y °/s. | 10 min | ⭐⭐ |
-| 4️⃣ | **`tasks.c`** (+`.h`) | ⭐ **EL ARCHIVO CLAVE.** Las 3 tareas + la ISR + toda la sincronización (cola, mutex, spinlock). Aquí está el filtro complementario, el control P y el patrón ISR→bandera→tarea. **Es lo que más te van a preguntar.** | 30 min | ⭐⭐⭐ |
-| 5️⃣ | **`servos.c`** (+`.h`) | Cómo se **genera el PWM** con MCPWM: la cadena timer→operator→comparator→generator, y que mover el servo = cambiar el comparador. | 10 min | ⭐⭐ |
-
-**Si tenés poquísimo tiempo:** leé `config.h` (1) y `tasks.c` (4). Con esos dos entendés el 80 % del
-proyecto. `mpu6050.c` y `servos.c` son "cómo hablar con el hardware"; `tasks.c` es "la inteligencia".
-
-**Cómo leer `tasks.c` por dentro** (en este orden):
-1. Las variables globales de sincronización (cola, mutex, spinlock, banderas) — arriba del archivo.
-2. `gpio_isr_handler` — la ISR (corta: solo levanta una bandera).
-3. `task_sensor` — lee, filtra, atiende recalibración, publica.
-4. `task_actuator` — consume de la cola, control P, mueve servos.
-5. `task_monitor` — imprime.
-6. `tasks_sync_init` y `tasks_start` — crean todo (al final, es "plomería").
+> **🔗 Correlación código ↔ guía (en los dos sentidos).** El código fuente tiene comentarios con marcas
+> **`[Guia §X]`** que apuntan a la sección de esta guía que explica ese concepto. Por ejemplo, en `tasks.c`
+> la línea del filtro dice `[Guia §II.8]`, y acá §II.8 lo explica desde cero. Así podés estudiar leyendo el
+> código y saltando a la teoría, o al revés. La tabla de correspondencia rápida:
+>
+> | Archivo | Concepto principal | Sección |
+> |---|---|---|
+> | `config.h` | Parámetros ajustables | §IV.4 |
+> | `main.c` | Arranque del sistema | §II.2, §IV |
+> | `mpu6050.c/.h` | Sensor + protocolo I2C | §II.9.a, §III.2 |
+> | `servos.c/.h` | PWM / MCPWM | §II.9.c |
+> | `tasks.c` (clave) | Tareas, ISR, sincronización, filtro, control | §II.4–II.8, §IV.3, §V |
+> | `tasks.h` | Struct de la cola | §II.6.c |
 
 ---
-
-## B. Recorrido paso a paso de los datos (de la vibración al servo)
-
-Este es el **flujo completo** que pediste: seguí un dato desde que el avión se inclina hasta que el
-servo lo corrige. Entre cada paso se indica **qué viaja** y **en qué formato**.
-
-### 🔵 Flujo principal (lazo de control, se repite 50 veces por segundo)
-
-**Paso 1 — El mundo físico.**
-El avión se inclina (viento, vibración del motor, una mano que lo mueve). El **MPU6050** siente dos
-cosas: la **aceleración** (incluida la gravedad) y la **velocidad angular** (giroscopio).
-
-**Paso 2 — Lectura por I2C.** `task_sensor` (cada 20 ms) llama a `mpu6050_read()`.
-- Se arma una transacción I2C: `START → dirección 0x68+W → registro 0x3B → RESTART → 0x68+R → 14 bytes → STOP`.
-- El ESP32 (maestro) marca el reloj por **SCL** y los datos van y vienen por **SDA**, a 400 kHz.
-- ↓ *Viaja:* **14 bytes crudos** (`uint8_t raw[14]`), big-endian.
-
-**Paso 3 — Reconstrucción y escalado** (dentro de `mpu6050_read`).
-- Cada par de bytes se une en un entero con signo de 16 bits: `(int16_t)((raw[0]<<8) | raw[1])`.
-- Se divide por el factor del datasheet: `/16384` → *g* (acelerómetro), `/131` → °/s (giroscopio).
-- ↓ *Viaja:* un `mpu6050_reading_t` = **5 floats** (`acc_x/y/z`, `gyro_x/y`) en unidades físicas.
-
-**Paso 4 — Cálculo de ángulos** (en `task_sensor`).
-- *Ángulo por acelerómetro* (dónde está la gravedad): `accel_roll = atan2(acc_y, acc_z)` → grados.
-- *Ángulo por giroscopio* (cuánto rotó): se integra `gyro_x · dt`.
-- ↓ *Viaja:* dos estimaciones del mismo ángulo, una ruidosa (acel) y una con drift (giro).
-
-**Paso 5 — Filtro complementario** (el "cerebro" del procesamiento, en `task_sensor`).
-```c
-roll = 0.98*(roll + gyro_x*0.02) + 0.02*accel_roll;   // (y lo mismo para pitch)
-```
-- Fusiona ambas: 98 % giroscopio (rápido, sin vibración) + 2 % acelerómetro (ancla, sin drift).
-- ↓ *Viaja:* **el ángulo limpio** `roll` (y `pitch`), en grados.
-
-**Paso 6 — Publicación en la cola** (en `task_sensor`).
-```c
-imu_data_t data = { .roll = roll, .pitch = pitch };
-xQueueSend(imu_queue, &data, 0);   // si está llena, descarta (no frena los 50 Hz)
-```
-- ↓ *Viaja:* una copia del struct `imu_data_t` **por dentro de la cola** `imu_queue` (IPC por copia).
-
-**Paso 7 — El actuador despierta** (`task_actuator`, prioridad 7 = ALTA).
-- Estaba **bloqueado** en `xQueueReceive(imu_queue, &data, 100ms)`. Al llegar el dato, se **desbloquea**
-  y —por tener más prioridad que el sensor— **desaloja** (preempt) al sensor para correr ya mismo.
-- ↓ *Viaja:* el `imu_data_t` recibido de la cola.
-
-**Paso 8 — Cálculo del error y control proporcional** (en `task_actuator`).
-```c
-float z_roll = zero_roll;                 // leído bajo mutex (punto cero)
-float error_roll = data.roll - z_roll;    // cuánto está desviado del "nivelado"
-float s1 = 1500 + SERVO1_DIR * error_roll * 10;   // 10 µs por grado
-float s2 = 1500 + SERVO2_DIR * error_roll * 10;
-```
-- ↓ *Viaja:* dos anchos de pulso `s1`, `s2` en µs.
-
-**Paso 9 — Saturación** (en `task_actuator`).
-- Se recorta cada pulso a `[1000, 2000]` µs (protege el servo).
-
-**Paso 10 — Orden a los servos.** `servos_set_us(s1, s2)`.
-- Cambia el **valor del comparador** de cada canal MCPWM: `mcpwm_comparator_set_compare_value(...)`.
-- ↓ *Viaja:* el nuevo ancho de pulso al hardware MCPWM.
-
-**Paso 11 — Generación del PWM** (hardware MCPWM, sin CPU).
-- El timer cuenta de 0 a 20000 (20 ms). Al inicio del periodo pone el GPIO en **ALTO**; al llegar al
-  comparador (p. ej. 1550) lo pone en **BAJO**. Resultado: un pulso de 1550 µs cada 20 ms, en **GPIO16/17**.
-- ↓ *Viaja:* una **señal eléctrica PWM** por el cable de señal del servo.
-
-**Paso 12 — Movimiento mecánico.**
-- El SG90 traduce el ancho de pulso a un ángulo del brazo → mueve el **alerón** → **corrige la inclinación**.
-- El avión se nivela → en el próximo ciclo el error es menor → el servo se mueve menos. **Lazo cerrado.**
-
-> **Todo esto (pasos 2 a 12) ocurre en menos de 20 ms, 50 veces por segundo.** Ese es el requisito de tiempo real.
-
-### 🟡 Flujo secundario 1 — Fijar el punto cero (evento del pulsador)
-
-1. Tocás el sensor → **flanco de bajada en GPIO19** → el hardware dispara la **ISR** `gpio_isr_handler`.
-2. La ISR (mínima) chequea el antirrebote (300 ms) y **solo** hace `zero_reset_requested = true`
-   (protegido por el spinlock `isr_mux`). Termina en microsegundos.
-3. En su próximo ciclo, `task_sensor` ve la bandera, toma el `zero_mutex` y hace
-   `zero_roll = roll; zero_pitch = pitch;` → **la inclinación actual pasa a ser el nuevo "nivelado"**.
-4. Desde ahí, el `error` del Paso 8 se mide contra este nuevo cero.
-
-### 🟢 Flujo secundario 2 — Monitoreo (cada 200 ms)
-
-1. `task_monitor` (prioridad 3 = BAJA) lee `last_roll`/`last_pitch` (bajo spinlock) y `zero_*` (bajo mutex).
-2. Los imprime por **UART0** con `ESP_LOGI` → los ves en la consola (`idf.py monitor`, 115200 baud).
-3. Por ser la de menor prioridad, **nunca estorba** al sensor ni al actuador.
-
-### Resumen de "quién le habla a quién"
-
-```
-                    ┌──────────── zero_reset (spinlock) ────────────┐
-   TTP223/botón ──ISR──> [bandera] ──> task_sensor                  │
-                                          │  (lee I2C, filtra)       │
-   MPU6050 ──I2C──> task_sensor ──imu_queue(copia)──> task_actuator ─┴─> servos_set_us ──PWM──> SG90 x2
-                        │                                 │
-                        └── zero_roll/pitch (mutex) ──────┤
-                        └── last_roll/pitch (spinlock) ─> task_monitor ──UART──> Consola
-```
-
 ---
 
-## 1. Veredicto de las tres verificaciones pedidas
+# PARTE I — EL PROYECTO EN CRIOLLO
 
-### 1.A ¿Todo lo implementado lo vimos en la cursada?
+## I.1 El problema
 
-**Mayormente sí, pero hay 2–3 cosas que NO aparecen en el material de clase** y que conviene tener
-preparadas para justificar (no está mal usarlas, pero el profesor pidió saber de dónde salió cada cosa).
+Un avión **ala volante** (como el bombardero B-2) no tiene cola ni timón vertical: es solo un ala con
+forma de boomerang. Esa forma lo hace **inestable**: cualquier soplo de viento o vibración lo inclina, y
+si nadie corrige esa inclinación al instante, se desestabiliza y cae. Un piloto humano **no reacciona lo
+suficientemente rápido** (habría que corregir decenas de veces por segundo). Además, el motor vibra y esa
+vibración **ensucia** las mediciones del sensor de inclinación.
 
-| Elemento implementado | ¿Visto en clase/lab? | Dónde |
+Entonces hay **dos problemas**: (1) corregir la inclinación automáticamente y muy rápido, y (2) medir la
+inclinación de forma **limpia** a pesar de la vibración.
+
+## I.2 La idea de la solución (en una imagen)
+
+Es un **sistema de control de lazo cerrado**. La mejor analogía es el **termostato** de una estufa:
+mide la temperatura, la compara con la deseada, y si hay diferencia, enciende/apaga la estufa. Repite
+esto para siempre. Nuestro sistema hace lo mismo pero con **ángulo de inclinación** en vez de temperatura:
+
+1. **Mide** la inclinación del avión (con un sensor).
+2. La **compara** con la inclinación deseada (el "nivelado", que llamamos *punto cero*).
+3. Si hay diferencia (*error*), **mueve dos aletas** (alerones) para contrarrestarla.
+4. Vuelve al paso 1. Esto pasa **50 veces por segundo**.
+
+"Lazo cerrado" significa justamente eso: la salida (mover los alerones) afecta a lo que se mide después
+(el avión se endereza), y esa nueva medición vuelve a entrar al sistema. Se retroalimenta.
+
+## I.3 Vista de pájaro de las piezas
+
+```
+   [Sensor de inclinación]  →  [Cerebro: ESP32]  →  [Aletas motorizadas]
+        MPU6050                (mide, filtra,         2 servos SG90
+      (acelerómetro            decide, ordena)        que mueven los alerones
+       + giroscopio)                 │
+                                     │
+                              [Botón] para decir
+                            "esta posición es el 0"
+                                     │
+                              [Puerto serie] para
+                             ver los números en la PC
+```
+
+- **ESP32:** la computadorcita (microcontrolador) que ejecuta todo el programa.
+- **MPU6050:** el sensor que dice cómo está inclinado el avión.
+- **Servos SG90:** dos motorcitos que mueven los alerones.
+- **Botón:** para fijar cuál es la posición "nivelada" de referencia.
+- **Puerto serie:** cable por el que el ESP32 le "cuenta" a la PC qué está pasando.
+
+Todo el resto del documento explica **cada una de estas piezas y cómo se hablan entre sí**.
+
+---
+---
+
+# PARTE II — CONCEPTOS DESDE CERO
+
+Esta es la parte teórica. Cada sección: **qué es → por qué existe → cómo lo usamos → dónde lo vimos.**
+
+## II.1 ¿Qué es un "Sistema de Tiempo Real"? (el nombre de la materia)
+
+Un **sistema de tiempo real (STR)** es un sistema donde **no alcanza con dar el resultado correcto: hay
+que darlo a tiempo**. Si la respuesta llega tarde, aunque sea correcta, **no sirve** (o es un desastre).
+
+- Ejemplo cotidiano: el airbag de un auto. De nada sirve que se infle "correctamente" medio segundo
+  después del choque. Tiene que ser *ya*.
+- En nuestro proyecto: de nada sirve calcular perfectamente la corrección del alerón si el avión ya se
+  cayó porque tardamos demasiado.
+
+Se distinguen dos tipos:
+- **Tiempo real duro (hard):** si te pasás del plazo, el sistema **falla** (airbag, marcapasos). Nuestro
+  control de vuelo es de este tipo conceptualmente.
+- **Tiempo real blando (soft):** pasarse del plazo **degrada** la calidad pero no es catástrofe (un video
+  que se traba un instante).
+
+> **La palabra clave del STR es "determinismo":** poder **garantizar** que algo va a ocurrir dentro de un
+> plazo conocido, siempre. No "rápido en promedio", sino "nunca más tarde de X". Todo lo que sigue (RTOS,
+> prioridades, interrupciones) existe para lograr ese determinismo.
+
+*(Diapositiva `01-sistemas_tiempo_real`.)*
+
+## II.2 Microcontrolador y el ESP32 — ❓ Tu pregunta 6
+
+> **❓ Tu pregunta 6:** *Usamos una ESP32. ¿Cómo funciona? ¿Qué necesitamos para compilar y guardar el
+> programa en ella? ¿FreeRTOS ya viene dentro de la ESP32?*
+
+### ¿Qué es un microcontrolador?
+Una **computadora entera dentro de un solo chip**, pensada para controlar cosas físicas (sensores,
+motores), no para navegar por internet. Tiene lo mismo que una PC pero en miniatura y modesto:
+- **CPU** (procesador que ejecuta las instrucciones),
+- **RAM** (memoria de trabajo, se borra al apagar),
+- **Flash** (memoria permanente donde vive tu programa, como el "disco"),
+- **Periféricos** (bloques de hardware para hablar con el mundo: pines, I2C, PWM, puerto serie…).
+
+La diferencia con un microprocesador (el de tu PC) es que el micro **trae todo integrado** y está hecho
+para ejecutar **un solo programa** a la vez, de forma confiable y por años.
+
+### El ESP32 en concreto
+- **CPU:** Xtensa LX6 de **dos núcleos** a 240 MHz (dos "cerebros" que pueden trabajar en paralelo).
+- **RAM:** 520 KB. **Flash:** 2 MB (donde guardamos nuestro firmware, que ocupa ~186 KB).
+- **Periféricos que usamos:** I2C (para el sensor), MCPWM (para los servos), UART (puerto serie), GPIO con
+  interrupciones (para el botón), timers.
+- **Alimentación:** 3.3 V, se alimenta por el cable USB.
+
+> **"Firmware"** = el programa que grabás dentro de un dispositivo embebido. Es "software", pero como vive
+> pegado al hardware y no se cambia todos los días, se lo llama firmware.
+
+### ¿Cómo se ejecuta un programa en el ESP32? (arranque)
+Cuando le das energía: un pequeño programa grabado de fábrica (**bootloader de ROM**) arranca, carga
+nuestro **bootloader** (que está en la flash), y este a su vez carga **nuestra aplicación**. En ese punto
+arranca el sistema operativo (FreeRTOS) y finalmente se llama a nuestra función `app_main()`.
+
+### ¿Qué necesitamos para compilar y grabar? 
+Necesitás el **ESP-IDF** (Espressif IoT Development Framework), que es el kit oficial de desarrollo del
+ESP32. Trae **todo**:
+1. El **compilador** cruzado `xtensa-esp32-elf-gcc` (traduce nuestro C al lenguaje máquina del ESP32).
+2. El **sistema de compilación** (CMake + Ninja) que orquesta todo.
+3. El **grabador** `esptool`, que manda el programa por el cable USB a la flash del chip.
+4. **FreeRTOS y los drivers** ya incluidos como librerías.
+
+El flujo práctico es: `idf.py build` (compila) y `idf.py flash` (graba por USB). El cable USB tiene un
+chip que convierte USB ↔ puerto serie, y el ESP32 tiene un modo especial de arranque que permite que
+`esptool` le escriba la flash por ese puerto serie.
+
+### ¿FreeRTOS "viene dentro de la ESP32"?
+**No como hardware.** El chip ESP32 **no trae FreeRTOS grabado de fábrica**. FreeRTOS es **parte del
+ESP-IDF** (viene como código fuente/librería), y **se compila junto con tu programa** dentro del firmware.
+Cuando grabás el firmware, adentro va tu código **más** FreeRTOS. Al arrancar, ese FreeRTOS incluido toma
+el control y ejecuta tus tareas. O sea: no es del chip, es del SDK, y termina adentro de tu `.bin`.
+
+## II.3 ¿Qué es un RTOS? Y ❓ Tu pregunta 1 (µC/OS vs FreeRTOS)
+
+### El problema que resuelve un sistema operativo
+Nuestro programa tiene que hacer **varias cosas a la vez**: leer el sensor cada 20 ms, mover servos,
+imprimir por consola cada 200 ms, atender el botón. Si lo escribiéramos como un único `while(true)`
+gigante haciendo todo en orden, sería un lío frágil y difícil de temporizar.
+
+Un **sistema operativo (SO)** resuelve esto dejándote escribir cada actividad por separado (una **tarea**)
+y encargándose él de **repartir el tiempo del procesador** entre ellas.
+
+### ¿Qué lo hace "de tiempo real" (RTOS)?
+Un SO común (Windows, Linux de escritorio) reparte el CPU "de forma justa" entre todos los programas: nadie
+tiene garantías estrictas de *cuándo* le toca. Un **RTOS** (Real-Time Operating System) hace lo contrario:
+te deja fijar **prioridades** y **garantiza** que la tarea más importante que esté lista corre **ya**,
+desalojando a las menos importantes. Esa previsibilidad es lo que necesita el tiempo real.
+
+> Definición de la diapo `12-rtos`: *un RTOS gestiona las tareas y recursos de un sistema cuya operación
+> correcta depende tanto del resultado como del tiempo en que se produce.*
+
+### > ❓ Tu pregunta 1: ¿Vimos µC/OS? ¿Diferencias con FreeRTOS?
+
+**Sí.** En la teoría (diapo `12-rtos`) el profe explicó el RTOS usando **µC/OS-III** (se lee "micro C-OS
+tres"), de la empresa Micrium. Se ven sus funciones `OSTaskCreate`, `OSTaskQPend` (esperar en una cola),
+`OSMemCreate` (memoria), etc. **Pero en los laboratorios y en el proyecto usamos FreeRTOS**, porque es el
+RTOS que **viene incluido en el ESP-IDF** del ESP32. No es que uno sea "mejor": son dos implementaciones de
+**las mismas ideas** (tareas, prioridades, colas, semáforos, mutex). Cambia sobre todo el **nombre de las
+funciones**.
+
+| Aspecto | µC/OS-III (teoría) | FreeRTOS (nuestro proyecto) |
 |---|---|---|
-| RTOS, tareas, prioridades, planificador preemptivo | ✅ Sí | Diapo `12-rtos`, `01-sistemas_tiempo_real`, `FreeRTOS.pdf` |
-| `xTaskCreate`, stacks en *words*, prioridades | ✅ Sí | `FreeRTOS.pdf` |
-| `vTaskDelayUntil` (periodicidad exacta) | ✅ Sí | `FreeRTOS.pdf` |
-| Colas (queue) productor-consumidor, `xQueueSend/Receive`, `pdTRUE/pdFALSE` | ✅ Sí | Lab `U3_lab4` (ESP32+FreeRTOS), Diapo `12-rtos` |
-| Mutex de exclusión mutua | ✅ Sí | Diapo `08-sinc_hilos`, `FreeRTOS.pdf`, Lab `U3_lab1` |
-| Semáforo binario + ISR (patrón evento→tarea) | ✅ Sí (concepto) | Lab `U3_lab3` |
-| ISR por flanco de bajada en un pulsador, sin funciones bloqueantes | ✅ Sí | Lab `U3_lab3`, `U1_lab52` |
-| Sección crítica / spinlock | ✅ Sí (concepto) | Diapo `08-sinc_hilos` ("Spinlocks POSIX"), `12-rtos` |
-| Protocolo I2C (maestro/esclavo, SDA/SCL, pull-ups, direccionamiento 7 bits) | ✅ Sí | Lab `I2C_intro`, Diapo (sensores) |
-| Sensor MPU6050 (IMU: acelerómetro + giroscopio) | ✅ Sí | Lab `U3_lab1` (usa MPU6050), Diapo `02-señales` |
-| Servo SG90 por PWM (periodo 20 ms, pulso 1–2 ms) | ✅ Sí | Lab `U1_lab52`, `U2_lab1`, `U3_lab1` |
-| Actuadores / PWM / muestreo / cuantización / aliasing | ✅ Sí | Diapo `02-señales-sistemas_digitales` |
-| Filtro digital, FIR/IIR, **media móvil** | ✅ Sí | Diapo `13-filtros_digitales`, Lab `U3_lab1` |
-| **Filtro complementario (fusión giro+acelerómetro) + `atan2`** | ❌ **NO** | *No aparece en ningún material.* Ver §1.A.1 |
-| **API MCPWM de ESP-IDF (`mcpwm_prelude.h`, timer→operator→comparator→generator)** | ⚠️ Parcial | El *concepto* PWM/servo sí; **esta API concreta no** (los labs usaban `pigpio/gpioServo` en Raspberry). Ver §1.A.2 |
-| **API I2C legacy de ESP-IDF (`i2c_cmd_link`, `i2c_master_cmd_begin`)** | ⚠️ Parcial | El *protocolo* I2C sí; **esta API concreta no** (el lab usaba `pigpio/i2cOpen` en Raspberry) |
+| Origen / dueño | Micrium (hoy Silicon Labs) | Mantenido por Amazon (AWS) |
+| Licencia | Comercial históricamente; hoy abierto (Apache 2.0) | Abierta (MIT), gratis siempre |
+| Nombre de funciones | `OSTaskCreate`, `OSQPost`, `OSSemPost`… | `xTaskCreate`, `xQueueSend`, `xSemaphoreGive`… |
+| Crear tarea | `OSTaskCreate(...)` | `xTaskCreate(...)` |
+| Cola de mensajes | `OSTaskQPost/Pend` | `xQueueSend/xQueueReceive` |
+| Memoria | Bloques de tamaño fijo (`OSMemCreate`) para que sea determinista | Varios esquemas de *heap* (heap_1…heap_5) |
+| Dónde corre | Ejemplos sobre Linux/µC/OS | **Incluido en ESP-IDF**, corre en el ESP32 |
+| Certificaciones | Fuerte en seguridad crítica (médica, avónica) | Existe variante certificada (SafeRTOS) |
 
-#### 1.A.1 — El punto más importante: **el filtro cambió respecto a lo enseñado**
+**Cómo contestarlo en el examen (una frase):** *"En teoría vimos el concepto de RTOS con µC/OS-III; en el
+proyecto usamos FreeRTOS porque es el que trae el ESP-IDF del ESP32. Son la misma familia de conceptos
+—tareas, prioridades, colas, mutex— con distinta API. Nosotros aplicamos exactamente esas ideas."*
 
-- **En clase y en el Anteproyecto** el filtro era una **media móvil** (promediar las últimas N muestras).
-  Eso es un filtro **FIR pasabajos**, tema explícito de la diapo `13-filtros_digitales` y del `U3_lab1`.
-- **En el código real** se usa un **filtro complementario**:
-  `angle = α·(angle + gyro·dt) + (1−α)·accel_angle` con `α = 0.98`.
-  Esto **no es una media móvil**: es una **fusión de sensores** (sensor fusion) que combina la
-  integración del giroscopio con el ángulo del acelerómetro calculado con `atan2`.
-- **Ninguno de estos dos elementos (filtro complementario ni `atan2` para inclinación) aparece en el
-  material de clase.** No está "mal", de hecho es la técnica estándar y superior para estabilización,
-  pero **tenés que poder explicar por qué se cambió** (ver §5.5). Es el punto donde más probablemente
-  te pregunten "¿esto lo vieron?".
+## II.4 Tareas, prioridades y el planificador
 
-#### 1.A.2 — Migración de plataforma: Raspberry Pi (POSIX) → ESP32 (FreeRTOS)
+### ¿Qué es una tarea (task)?
+Una **tarea** es una función que corre "en paralelo" con las demás, cada una en su propio bucle infinito.
+En FreeRTOS es lo que en la teoría POSIX se llamaba un **hilo (thread)**: una **unidad de ejecución**. Todas
+las tareas comparten la misma memoria del programa (importante, porque de ahí surge la necesidad de
+sincronizar, más abajo).
 
-Buena parte de la cursada fue en **Raspberry Pi con POSIX** (pthreads, colas de mensajes POSIX `mq_send`,
-pipes, timers POSIX, `pigpio`). El proyecto final está en **ESP32 con FreeRTOS**, que usa **otras APIs**
-para los **mismos conceptos**. La correspondencia es directa (ver §11), pero conviene tenerla clara
-porque el profesor puede preguntar "esto en POSIX ¿cómo era?".
+En nuestro proyecto hay **tres tareas**:
+- `task_sensor`: lee el sensor y filtra, 50 veces por segundo.
+- `task_actuator`: recibe el ángulo y mueve los servos.
+- `task_monitor`: imprime por consola cada 200 ms.
 
----
+### ¿Qué es el planificador (scheduler) y la "prioridad"?
+Como el ESP32 tiene pocos núcleos y varias tareas, alguien tiene que decidir **cuál corre en cada momento**.
+Ese árbitro es el **planificador** de FreeRTOS. Su regla en un RTOS **preemptivo** es simple y estricta:
 
-### 1.B ¿Coincide la implementación con `DOCUMENTACION.md`?
+> **Siempre corre la tarea de mayor prioridad que esté lista para ejecutarse.** Si mientras corre una tarea
+> de baja prioridad se despierta una de mayor prioridad, el planificador **interrumpe** (desaloja, en inglés
+> *preempt*) a la de baja y le da el CPU a la de alta **de inmediato**.
 
-**Sí, en un ~95%.** `DOCUMENTACION.md` describe fielmente el código (verifiqué pines, escalas, filtro,
-control P, cadena MCPWM, prioridades, colas, mutex, spinlock, ISR). Encontré 4 discrepancias; **3 ya las
-corregí** (en el código y/o en la doc) y **1 queda para verificar en el hardware**:
+Analogía: un gerente con empleados. Si entra un pedido urgente (tarea de alta prioridad), el gerente le
+saca la máquina al empleado que hacía algo secundario y se la da al urgente.
 
-| # | Tema | Discrepancia detectada | Estado |
-|---|---|---|---|
-| 1 | **Naturaleza del pulsador** | La doc (§3.4) lo describía como TTP223 capacitivo con una explicación enrevesada y contradictoria del flanco; el código lo trata como entrada **pull-up + flanco de bajada** (botón a GND). | ✅ **`DOCUMENTACION.md` reescrita** (§3.4 y nota de pines) para describirlo tal como lo hace el código. ⚠️ Queda **verificar el módulo físico** (ver §17). |
-| 2 | **Comentario de la ISR** | `tasks.c` rotulaba la ISR como *"flanco positivo"*, pero la config real es `GPIO_INTR_NEGEDGE` (flanco **negativo**). | ✅ **Corregido** en `tasks.c`. |
-| 3 | **Uso de núcleos** | Doc: "solo se usa un núcleo". En realidad usa `xTaskCreate` (no `PinnedToCore`), así que FreeRTOS **puede repartir** en los 2 núcleos. | ℹ️ La doc ya lo aclaraba entre paréntesis. Tenelo presente: **no fijamos núcleo** (los labs sí lo pedían). |
-| 4 | **Comentario "pull-down"** | `main.c` (modo de prueba del botón) comentaba *"pull-down"* usando en realidad `GPIO_PULLUP_ENABLE`. | ✅ **Resuelto**: el modo de prueba se eliminó en la limpieza "modo estudio". |
+En nuestro proyecto las prioridades son (número más alto = más importante):
 
-Ninguna afectaba el funcionamiento; eran inconsistencias de **comentarios/descripción**, salvo el punto
-1 que conviene verificar contra el hardware real.
+| Tarea | Prioridad | Por qué esa prioridad |
+|---|:---:|---|
+| `task_actuator` | **7 (alta)** | Es la que **cierra el lazo** (mueve los servos). Es lo más crítico en el tiempo: apenas hay un dato nuevo, tiene que corregir ya. |
+| `task_sensor` | **5 (media)** | Produce los datos. Importante, pero si el actuador está corrigiendo, que corrija primero. |
+| `task_monitor` | **3 (baja)** | Solo imprime para que miremos. Puede esperar; **nunca** debe estorbar al control. |
 
----
+> **Decisión de diseño clave:** el consumidor (actuador) tiene **más** prioridad que el productor (sensor).
+> Esto asegura que la corrección ocurre lo antes posible después de cada medición.
 
-### 1.C ¿Coincide con el Anteproyecto?
+### ¿Cómo se garantiza que el sensor corra "exactamente" cada 20 ms?
+Con una función especial: **`vTaskDelayUntil`**. La diferencia con la típica `vTaskDelay` (que espera "20 ms
+desde ahora") es que `vTaskDelayUntil` despierta la tarea en **instantes absolutos** (20, 40, 60, 80 ms…),
+sin importar cuánto tardó el trabajo. Así el muestreo es **exactamente 50 Hz** sin acumular retrasos. Es
+una herramienta de tiempo real: garantiza **periodicidad**.
 
-El objetivo, hardware y arquitectura general **coinciden**. Hay **tres desviaciones de alcance**
-deliberadas que debés saber justificar:
+*(Tareas/prioridades: diapos `05-hilos`, `12-rtos` y `FreeRTOS.pdf`. `vTaskDelayUntil`: `FreeRTOS.pdf`.)*
 
-| # | Anteproyecto prometía | Implementación real | Por qué |
-|---|---|---|---|
-| 1 | Filtro de **media móvil** | **Filtro complementario** | Mejor rechazo de vibración y sin drift; ver §5.5 |
-| 2 | Corregir **ambos ejes** (roll: servos opuestos; pitch: servos iguales) | **Un solo eje: roll**; el pitch solo se mide y reporta | `config.h` lo declara "por requerimiento, un solo eje". (En la versión "modo estudio" la rama de control de pitch se quitó por no usarse.) |
-| 3 | 3 hilos: Productor(raw) → Consumidor(filtra) → Actuación(servo) | 3 tareas: **Sensor**(lee **y filtra**) → **Actuador**(consume y mueve) → **Monitor**(imprime) | El filtrado se movió al productor; se agregó una tarea de monitor. Concepto productor-consumidor preservado |
+## II.5 Interrupciones e ISR — ❓ Tu pregunta 7
 
-Además, el Anteproyecto dice "servos en sentidos contrarios" para roll; el código usa
-`SERVO1_DIR = SERVO2_DIR = +1.0` (mismo signo eléctrico) porque **el servo 2 está montado espejado
-físicamente**, con lo que mecánicamente giran opuestos. Es un ajuste de montaje, no un cambio de lógica.
+> **❓ Tu pregunta 7:** *El botón genera una ISR. ¿Cómo funciona esta interrupción? ¿Es una interrupción de
+> FreeRTOS? Cuando presionamos el botón, ¿hay que tener en cuenta el efecto rebote? ¿Cómo lo manejamos?*
 
----
+### ¿Qué es una interrupción?
+Normalmente el CPU ejecuta tu programa línea por línea. Una **interrupción** es un mecanismo del **hardware**
+que le dice al CPU: *"pará todo lo que estás haciendo AHORA y atendé esto urgente"*. El CPU guarda dónde
+estaba, salta a ejecutar una función especial (la **ISR**, *Interrupt Service Routine* = rutina de servicio
+de interrupción), y cuando esta termina, vuelve exactamente a donde estaba.
 
-## 2. Tecnologías y herramientas
+Analogía: estás cocinando (tu programa) y suena el **timbre** (la interrupción). Dejás todo, atendés la
+puerta (la ISR), y volvés a cocinar donde ibas.
 
-| Capa | Tecnología | Rol en el proyecto |
-|---|---|---|
-| Lenguaje | **C** (C11) | Todo el firmware |
-| Framework | **ESP-IDF 6.1** (Espressif IoT Development Framework) | SDK oficial del ESP32: drivers, build, flasheo |
-| Sistema operativo | **FreeRTOS** (incluido en ESP-IDF) | RTOS: tareas, colas, mutex, planificación preemptiva |
-| Build | **CMake + Ninja**; compilador `xtensa-esp32-elf-gcc` | Compilación cruzada a Xtensa LX6 |
-| Flasheo/monitor | `idf.py flash monitor`, `esptool` | Cargar y ver la consola serie (115200 baud) |
-| Config del SDK | `sdkconfig` / `sdkconfig.defaults` (Kconfig) | Tick 1000 Hz, IRAM para GPIO, flash 2 MB, etc. |
+**¿Por qué usar una interrupción para el botón y no "preguntar" todo el tiempo si está apretado?** Porque
+preguntar constantemente (*polling*) gasta CPU y puede perder el evento si justo estabas ocupado. La
+interrupción es **inmediata y no gasta nada** hasta que ocurre. Por eso el anteproyecto pedía que el botón
+tuviera "máxima prioridad": una interrupción de hardware desaloja a **cualquier** tarea.
 
----
+### ¿Es una interrupción "de FreeRTOS"?
+**No.** La interrupción es del **hardware del ESP32** (el periférico de GPIO detecta el cambio en el pin y
+fuerza el salto). FreeRTOS **no** genera la interrupción. Lo único que FreeRTOS aporta es un conjunto de
+funciones especiales (terminadas en `...FromISR`) por si la ISR necesita comunicarse con una tarea. En
+nuestro caso, la ISR **ni siquiera usa FreeRTOS**: solo levanta una bandera y lee el reloj. Es una ISR de
+hardware pura. La registramos con dos funciones del ESP-IDF: `gpio_install_isr_service()` y
+`gpio_isr_handler_add()`.
 
-## 3. Sistema operativo (FreeRTOS) — lo esencial
+### La regla de oro: la ISR debe ser CORTÍSIMA
+Mientras corre una ISR, **el resto del sistema está frenado**. Por eso una ISR **no debe** hacer trabajo
+pesado, ni imprimir, ni esperar. Nuestra ISR hace lo mínimo: anota "me apretaron el botón" en una bandera
+(`zero_reset_requested = true`) y termina en microsegundos. **El trabajo real** (fijar el nuevo punto cero)
+lo hace después, tranquila, la `task_sensor`. Este patrón se llama **"trabajo diferido"** (deferred
+processing): la ISR **avisa**, la tarea **hace**.
 
-- **Definición (de la diapo 12):** un RTOS "gestiona tareas y recursos de un sistema cuya operación
-  correcta depende tanto del **resultado** como del **tiempo** en que se produce".
-- **Preemptivo por prioridades:** la tarea *lista* de mayor prioridad siempre se ejecuta; si llega una
-  de mayor prioridad, **desaloja** (preempt) a la que corría. En este proyecto esto es clave: cuando el
-  sensor deposita un dato, el **actuador (prio 7)** desaloja al **sensor (prio 5)** para corregir cuanto antes.
-- **Tick del sistema: 1000 Hz** (`CONFIG_FREERTOS_HZ=1000`), es decir **1 tick = 1 ms**. Necesario para
-  que `pdMS_TO_TICKS(20)` y `pdMS_TO_TICKS(200)` sean exactos.
-- **Componentes del RTOS que usamos** (de la teoría): planificador, controlador de interrupciones
-  (ISR del pulsador), gestor de recursos (stacks de tareas), reloj de tiempo real (`esp_timer`).
+También la marcamos con `IRAM_ATTR`, que la coloca en la RAM interna (en vez de en la flash). Así siempre
+está disponible al instante, con latencia mínima y predecible (no depende de la caché de la flash).
 
----
+### > El efecto rebote (debounce)
+Los botones físicos, al apretarse, **no** hacen un contacto limpio: los metales "rebotan" durante unos
+milisegundos y generan **muchos pulsos eléctricos** por una sola pulsación. Si no lo tenemos en cuenta, un
+solo toque dispararía la ISR varias veces.
 
-## 4. Hardware / dispositivos
-
-### 4.1 ESP32 (microcontrolador — "el cerebro")
-- Xtensa **LX6 dual-core @ 240 MHz**, 520 KB SRAM, 2 MB flash (firmware ~186 KB ≈ 18%).
-- Periféricos usados: **I2C** (bus del sensor), **MCPWM** (servos), **GPIO+interrupciones** (pulsador),
-  **UART0** (consola serie), **esp_timer** (antirrebote).
-- Lógica a 3.3 V; alimentado por USB.
-
-### 4.2 MPU6050 (sensor inercial / IMU, entrada)
-- IMU de **6 ejes** = acelerómetro 3 ejes + giroscopio 3 ejes.
-- **Acelerómetro:** mide aceleración en *g*; en reposo detecta la gravedad → da la inclinación **estática**
-  vía trigonometría (`atan2`). Estable a largo plazo pero **muy ruidoso** ante vibración.
-- **Giroscopio:** mide velocidad angular (°/s); integrando da el ángulo. Preciso a **corto plazo** pero
-  **acumula drift**.
-- **Se usan los dos** y se fusionan (§5.5). I2C **400 kHz**, dirección **0x68**, rangos **±2g** y **±250 °/s**.
-
-### 4.3 Servos SG90 (actuadores, salida) ×2
-- Micro-servos controlados por **PWM**: periodo **20 ms (50 Hz)**; ancho de pulso define la posición:
-  **1000 µs → −90°**, **1500 µs → 0° (neutro)**, **2000 µs → +90°**.
-- **Servo 1 = GPIO16 (alerón izq)**, **Servo 2 = GPIO17 (alerón der)**. En un ala volante se llaman
-  **elevones** (combinan alerón + elevador).
-
-### 4.4 Sensor táctil / pulsador (evento, entrada)
-- Conectado a **GPIO19**, con **pull-up interno** e **interrupción por flanco de bajada**.
-- Función: fijar el **punto cero** (la inclinación actual pasa a ser el nuevo "nivelado").
-- ⚠️ El código lo trata como **botón clásico a GND**; el Anteproyecto/doc lo llaman **TTP223 capacitivo**
-  (ver §1.B punto 1 y §6).
-
-### 4.5 Mapa de pines
-| Señal | GPIO | Componente |
-|---|---|---|
-| I2C SDA / SCL | 21 / 22 | MPU6050 |
-| PWM Servo 1 / 2 | 16 / 17 | SG90 izq / der |
-| Pulsador (ISR) | 19 | Táctil / botón |
-
----
-
-## 5. Tratamiento de la señal y procesamiento de datos
-
-### 5.1 Señales, sensores y actuadores (marco teórico, diapo 02)
-El proyecto es un **sistema digital de control** clásico:
-`Sensor (MPU6050) → Controlador digital (ESP32) → Actuador (servos) → Planta (avión)`.
-El MPU6050 **muestrea** una magnitud física (inclinación) → señal **discreta en tiempo**;
-internamente la **cuantiza** a enteros de 16 bits (int16). Nosotros muestreamos a **50 Hz**.
-
-### 5.2 Lectura cruda por I2C
-Se leen **14 bytes de golpe** desde `ACCEL_XOUT_H (0x3B)`: acc(XYZ)+temp+gyro(XYZ). El MPU6050 entrega
-**big-endian** (byte alto primero):
-```c
-int16_t acc_x = (int16_t)((raw[0] << 8) | raw[1]);   // cast a int16_t = complemento a 2
-```
-El cast a `int16_t` es esencial para interpretar bien los valores **negativos**.
-
-### 5.3 Escala a unidades físicas (factores del datasheet)
-```c
-out->acc_x  = acc_x / 16384.0f;   // ±2g   → g
-out->gyro_x = gyr_x / 131.0f;     // ±250  → °/s
-```
-
-### 5.4 Ángulo por acelerómetro (`atan2`)
-```c
-accel_roll  = atan2f(acc_y, acc_z) * 57.2957795f;                 // 180/π
-accel_pitch = atan2f(-acc_x, sqrtf(acc_y*acc_y + acc_z*acc_z)) * 57.2957795f;
-```
-`atan2` devuelve el ángulo en [−π, π] usando el vector gravedad. Es exacto en reposo pero **se ensucia
-con la vibración del motor**.
-
-### 5.5 ⭐ Filtro complementario (el corazón del procesamiento)
-```c
-roll  = COMP_ALPHA * (roll  + r.gyro_x * SENSOR_DT_S) + (1.0f - COMP_ALPHA) * accel_roll;
-pitch = COMP_ALPHA * (pitch + r.gyro_y * SENSOR_DT_S) + (1.0f - COMP_ALPHA) * accel_pitch;
-```
-Con `α = 0.98` y `dt = 0.02 s`:
-- **98 %** viene de **integrar el giroscopio** → respuesta rápida y sin ruido de vibración.
-- **2 %** viene del **acelerómetro** → "ancla" el ángulo a la gravedad real y **elimina el drift**.
-
-**Por qué se eligió sobre la media móvil del Anteproyecto:** la media móvil solo suaviza el ruido del
-acelerómetro pero **no resuelve el drift** ni aprovecha el giroscopio; introduce **retardo** (malo en
-tiempo real). El complementario **fusiona ambos sensores**, da lo mejor de cada uno y es la alternativa
-**barata al filtro de Kalman**. **Este es el tema a defender porque no se vio en clase.**
-
----
-
-## 6. Señales, interrupciones (ISR) y punto cero
+**Cómo lo manejamos (antirrebote por software):** guardamos el instante del último toque aceptado y, si el
+nuevo llega antes de **300 ms** después, lo **ignoramos**. Usamos `esp_timer_get_time()`, que da el tiempo
+en microsegundos desde el arranque (se puede llamar desde una ISR porque no involucra al planificador):
 
 ```c
-static void IRAM_ATTR gpio_isr_handler(void *arg) {
-    int64_t now = esp_timer_get_time();               // µs desde el arranque
-    portENTER_CRITICAL_ISR(&isr_mux);
-    if ((now - last_isr_time_us) >= BUTTON_DEBOUNCE_US) {  // antirrebote 300 ms
-        last_isr_time_us = now;
-        zero_reset_requested = true;                  // ← SOLO levanta una bandera
-    }
-    portEXIT_CRITICAL_ISR(&isr_mux);
+int64_t now = esp_timer_get_time();
+if ((now - last_isr_time_us) >= BUTTON_DEBOUNCE_US) {   // 300 ms
+    last_isr_time_us = now;
+    zero_reset_requested = true;   // recién acá aceptamos el toque
 }
 ```
-Conceptos (todos vistos en `U3_lab3`):
-- **`IRAM_ATTR`**: coloca la ISR en RAM interna → latencia mínima y determinística (no depende de la
-  caché de flash). Alineado con `CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y`.
-- **ISR corta y no bloqueante**: no imprime, no toma mutex, no hace el trabajo pesado. Solo escribe un
-  `bool`. El trabajo real (fijar el cero) lo hace `task_sensor` en su próximo ciclo con el ángulo fresco.
-  Este es el **patrón bandera/semáforo → tarea** ("deferred processing").
-- **Antirrebote por software**: 300 ms para que un toque no genere varios eventos.
-- **Flanco de bajada** (`GPIO_INTR_NEGEDGE`) con **pull-up**: en reposo la línea está en ALTO; el evento
-  se dispara al caer a BAJO.
 
-**El Anteproyecto exige "ISR de máxima prioridad"**: se cumple porque una interrupción de hardware
-**siempre desaloja** a cualquier tarea de FreeRTOS.
+*(Concepto de ISR + debounce + patrón "ISR entrega evento a tarea": laboratorio `U3_lab3`.)*
 
----
+## II.6 Sincronización y comunicación entre tareas — ❓ Tu pregunta 4
 
-## 7. Arquitectura de tareas, prioridades y gestión
+Como **todas las tareas comparten la misma memoria**, si dos tocan la misma variable al mismo tiempo se
+pueden pisar y corromper los datos. Esto se llama **condición de carrera** (*race condition*). Para evitarlo
+hay tres herramientas en el proyecto. Las explico por lo que resuelven.
 
-Tres tareas + una ISR (`xTaskCreate` — **no** se fija núcleo):
+### II.6.a — Sección crítica y spinlock (proteger algo por un instante)
+Una **sección crítica** es un tramo de código donde queremos que **nadie más** toque ciertas variables. En
+el ESP32 (que tiene dos núcleos) se protege con un **spinlock** (`portMUX`). "Spin" = el otro que quiera
+entrar **gira esperando activamente** (busy-wait) hasta que se libera. Sirve solo para tramos **ultra
+cortos** (leer/escribir un par de variables), y es lo único que se puede usar **también desde una ISR**
+(porque una ISR no puede "dormir").
 
-| Tarea | Prioridad | Disparo | Stack | Rol |
-|---|---|---|---|---|
-| `task_sensor` | **5** (media) | periódica **50 Hz** (`vTaskDelayUntil`) | 4096 w | Lee IMU, filtra, atiende recalibración, publica en la cola |
-| `task_actuator` | **7** (alta) | **por la cola** (`xQueueReceive`, timeout 100 ms) | 4096 w | Consume ángulo, control P, mueve servos |
-| `task_monitor` | **3** (baja) | periódica **200 ms** (`vTaskDelayUntil`) | 3072 w | Imprime estado por serie |
-| ISR pulsador | HW (máx) | flanco GPIO19 | — | Pide fijar punto cero |
-
-**Criterio de prioridades (justificación):** el **actuador** (crítico en tiempo, cierra el lazo) tiene
-**más prioridad que el productor**, de modo que apenas hay un dato, corrige. El **monitor** tiene la
-**menor** porque puede retrasarse sin afectar el control (solo informa). Esto es el modelo preemptivo
-por prioridades de la diapo 12.
-
-**Periodicidad exacta con `vTaskDelayUntil`** (visto en `FreeRTOS.pdf`):
+Lo usamos para las variables que comparten la **ISR** y la `task_sensor` (la bandera del botón y el último
+ángulo):
 ```c
-TickType_t last_wake = xTaskGetTickCount();
-for (;;) { /* trabajo */ vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SENSOR_PERIOD_MS)); }
+portENTER_CRITICAL_ISR(&isr_mux);   // desde la ISR
+zero_reset_requested = true;
+portEXIT_CRITICAL_ISR(&isr_mux);
 ```
-A diferencia de `vTaskDelay` (relativo, acumula deriva), `vTaskDelayUntil` calcula el próximo despertar
-sobre un **instante absoluto** → 50 Hz reales aunque la lectura I2C tarde distinto cada vez.
 
----
+### II.6.b — Mutex (proteger un recurso entre tareas)
+Un **mutex** (de *MUTual EXclusion*, exclusión mutua) es como la **llave de un baño**: solo una tarea puede
+tener la llave a la vez; las demás **esperan** (durmiendo, sin gastar CPU) hasta que se libere. A diferencia
+del spinlock, el que espera **duerme** (no gira). Se usa para recursos que se tocan por un rato y solo entre
+tareas (no ISR).
 
-## 8. Comunicación y sincronización entre tareas / ISR
-
-El proyecto usa **hilos (tareas de FreeRTOS), no procesos** → todo comparte el mismo espacio de memoria.
-Tres mecanismos, cada uno para su caso:
-
-### 8.1 Cola `imu_queue` — comunicación productor↔consumidor (push por copia)
-- `xQueueCreate(5, sizeof(imu_data_t))`; `imu_data_t = {float roll, pitch}`.
-- Productor `xQueueSend(..., 0)`: si está llena **descarta** y avisa (no puede frenar los 50 Hz).
-- Consumidor `xQueueReceive(..., 100 ms)`: **se bloquea** hasta que hay dato o vence el timeout. No hace
-  *polling* ni `vTaskDelay`; **la cola es su reloj**. Esto es exactamente el `U3_lab4` (cola productor-
-  consumidor entre tareas de distinta prioridad) y es una **IPC de tipo push** (diapo `10-ipc_push`):
-  el mensaje viaja por copia, no por memoria compartida.
-
-### 8.2 Mutex `zero_mutex` — exclusión mutua del punto cero
-- Protege `zero_roll` / `zero_pitch` (dos `float`, cuya lectura conjunta **no es atómica**).
-- Escritor: `task_sensor` (al recalibrar). Lectores: `task_actuator` y `task_monitor`.
-- `xSemaphoreTake(zero_mutex, 10 ms)` / `xSemaphoreGive(...)`. Si no lo toma en 10 ms usa un valor seguro
-  (0.0) ese ciclo. **Mutex = semáforo binario para exclusión mutua** (diapo 08, `FreeRTOS.pdf`).
-
-### 8.3 Spinlock `isr_mux` (`portMUX`) — sincronización tarea↔ISR
-- La ISR **no puede tomar un mutex** (bloquearía). En un ESP32 **dual-core** deshabilitar interrupciones
-  no basta, así que se usa un **spinlock** (espera activa) que protege `zero_reset_requested`,
-  `last_roll/pitch`, `last_servo*`.
-- `portENTER_CRITICAL_ISR(&isr_mux)` en la ISR / `portENTER_CRITICAL(&isr_mux)` en la tarea → sección
-  **atómica**. Concepto de **sección crítica / spinlock** de la diapo `08-sinc_hilos`.
-
-**Por qué mutex en un lado y spinlock en el otro:** el spinlock es para tramos **ultra cortos** que la
-ISR también toca (no puede dormir); el mutex es para el recurso `zero_*` al que acceden **solo tareas**
-(pueden dormir esperando).
-
----
-
-## 9. Lógica de control y actuación
-
-### 9.1 Control Proporcional (P)
+Lo usamos para el **punto cero** (`zero_roll`, `zero_pitch`), que son dos números que la `task_sensor`
+**escribe** y el `task_actuator`/`task_monitor` **leen**. Como son dos floats, leerlos "a medias" (uno
+actualizado y el otro no) daría un valor inconsistente; el mutex garantiza que se lean/escriban juntos.
 ```c
-float error_roll = data.roll - z_roll;          // desvío respecto al punto cero
-float s1 = SERVO1_ZERO_US, s2 = SERVO2_ZERO_US; // parten del neutro (1500 µs)
-s1 += SERVO1_DIR * error_roll * CONTROL_GAIN;   // GAIN = 10 µs por grado
-s2 += SERVO2_DIR * error_roll * CONTROL_GAIN;
+if (xSemaphoreTake(zero_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {  // pedir la llave (esperar máx 10 ms)
+    z_roll = zero_roll;                                          // sección protegida
+    xSemaphoreGive(zero_mutex);                                  // devolver la llave
+}
 ```
-- Corrección **proporcional al error** (5° → 50 µs). Es un **P puro** (sin I ni D): simple y suficiente
-  para llevar el error a ~0 en esta maqueta.
-- **Se controla un solo eje: el ROLL.** El pitch se calcula y se reporta por consola, pero no genera
-  corrección (así lo pide el alcance del proyecto para un ala volante, donde el roll es el eje natural).
-- `SERVO1_DIR/SERVO2_DIR` permiten invertir el sentido de un servo sin tocar la lógica (montaje espejo).
 
-### 9.2 Saturación (clamping)
+> **¿Mutex o spinlock?** Spinlock = tramo cortísimo que **también toca la ISR** (no puede dormir). Mutex =
+> recurso entre **tareas** que sí pueden esperar durmiendo. Por eso usamos cada uno donde corresponde.
+
+### II.6.c — Cola (queue): pasar datos de una tarea a otra
+
+> **❓ Tu pregunta 4:** *Una tarea productora publica el ángulo en una cola y otra lo consume. ¿Dónde se ve
+> esto? ¿Ventajas? ¿Desventajas? ¿Otras opciones? ¿Puede haber datos no consumidos? ¿En las colas siempre
+> se manejan datos estructurados?*
+
+Una **cola** es una **cinta transportadora** (o un buzón) entre dos tareas: una **deja** datos (productor) y
+la otra los **retira** (consumidor), en orden (el primero que entra es el primero que sale, FIFO). Es el
+mecanismo de comunicación **seguro** por excelencia entre tareas, porque **copia** el dato: el productor no
+comparte una variable con el consumidor, le **entrega una copia**, así no se pisan.
+
+**Dónde se ve en el código** (`tasks.c`):
+- Se crea con capacidad 5: `imu_queue = xQueueCreate(5, sizeof(imu_data_t));`
+- El productor `task_sensor` deja el ángulo: `xQueueSend(imu_queue, &data, 0);`
+- El consumidor `task_actuator` lo retira: `xQueueReceive(imu_queue, &data, ...);`
+
+Esto es el **patrón productor-consumidor** clásico, idéntico al laboratorio `U3_lab4`.
+
+**Ventajas:**
+- **Desacople:** productor y consumidor corren a su ritmo; no dependen uno del otro instante a instante.
+- **Seguridad automática:** la cola ya está protegida internamente; no tenés que poner mutex a mano.
+- **Sin espera activa:** el consumidor **se bloquea** (duerme) en `xQueueReceive` hasta que hay dato; no
+  malgasta CPU preguntando. Se despierta justo cuando llega algo. (En nuestro caso, la cola es el "reloj"
+  del actuador.)
+- **Amortigua baches:** si el consumidor se demora un instante, se acumulan hasta 5 muestras sin perder nada.
+
+**Desventajas:**
+- **Copia datos:** cada envío copia el struct (para structs chicos como el nuestro, insignificante; para
+  datos grandes, se preferiría enviar un puntero).
+- **Capacidad fija:** si se llena (consumidor más lento que productor), hay que decidir qué hacer (esperar o
+  descartar).
+- **Un pelín de latencia y memoria** frente a compartir una variable directamente.
+
+**Otras opciones que existían (y por qué la cola es la adecuada acá):**
+- **Variable global + mutex:** funciona, pero el consumidor tendría que "preguntar" cada tanto (polling) o
+  necesitarías otro mecanismo para avisarle que hay dato nuevo. Más frágil.
+- **Notificaciones directas a tarea (task notifications):** más livianas y rápidas, pero llevan solo un
+  número/bits, no un struct cómodo. Buenas para "avisar", no tanto para "pasar datos".
+- **Stream/Message buffers:** para flujos de bytes; acá no aplica.
+
+**¿Puede haber datos no consumidos?** **Sí, en dos sentidos:**
+1. Si la cola se **llena** (el actuador se atrasó), el `xQueueSend(..., 0)` con espera **cero** devuelve
+   error y **descartamos esa muestra** (con un warning). Es una decisión de diseño: el sensor **no puede
+   frenarse** esperando, porque debe mantener los 50 Hz. Perder una muestra vieja es preferible a romper el
+   ritmo.
+2. En el struct viaja también `pitch`, pero el actuador **solo usa roll** (controlamos un eje). Ese `pitch`
+   viaja "de acompañante" y no se consume para actuar (sí se reporta por otro camino en el monitor).
+
+**¿Las colas siempre manejan datos estructurados?** **No.** Una cola transporta elementos de un **tamaño
+fijo** cualquiera: puede ser un `int`, un `float`, un puntero, o —como acá— un **struct**. Usamos un struct
+(`imu_data_t { float roll; float pitch; }`) simplemente porque queremos mandar **dos valores juntos** como
+una sola unidad.
+
+*(Colas: `U3_lab4` y diapo `12-rtos`. Mutex/spinlock: diapo `08-sinc_hilos`.)*
+
+## II.7 Señales, sensores y muestreo (base para entender el I2C y los filtros)
+
+Antes de meternos con el sensor conviene una base mínima (diapo `02-señales`):
+
+- **Señal:** una magnitud que varía y lleva información (la inclinación del avión es una señal).
+- **Sensor:** convierte una magnitud física en una señal eléctrica (el MPU6050 convierte movimiento en
+  números).
+- **Señal analógica vs digital:** el mundo real es **analógico** (varía de forma continua). Las computadoras
+  trabajan en **digital** (números discretos). Por eso todo sensor internamente **muestrea** (toma fotos de
+  la señal cada cierto tiempo) y **cuantiza** (redondea cada foto a un número de bits).
+- **Frecuencia de muestreo:** cuántas "fotos" por segundo tomamos. Se mide en **Hz** (muestras por segundo).
+  Nosotros muestreamos a **50 Hz** (una foto cada 20 ms).
+- **Teorema del muestreo (Nyquist):** para captar bien una señal hay que muestrear a **más del doble** de la
+  frecuencia más alta que querés medir; si no, aparecen errores (*aliasing*). Como el avión no oscila más
+  rápido que unas pocas veces por segundo, 50 Hz sobra.
+
+## II.8 Filtros: de la media móvil al filtro complementario — ❓ Tu pregunta 3
+
+> **❓ Tu pregunta 3:** *¿Cómo funciona el filtro complementario exactamente? ¿Por qué fusionar giroscopio y
+> acelerómetro mejora nuestros datos?*
+
+### ¿Qué es un filtro y por qué lo necesitamos?
+Un **filtro** deja pasar lo que querés y elimina lo que no. Acá el problema es que las mediciones del sensor
+vienen **sucias** (la vibración del motor las contamina) y necesitamos un ángulo **limpio y estable** para
+controlar bien. El filtro es lo que las limpia.
+
+### Los dos sensores y sus defectos (la clave de todo)
+El MPU6050 tiene dos sensores que miden la inclinación de **maneras distintas**, y **cada uno tiene un
+defecto opuesto**:
+
+| Sensor | Cómo da el ángulo | Bueno en | Malo en |
+|---|---|---|---|
+| **Acelerómetro** | Mide dónde "tira" la gravedad y con trigonometría deduce la inclinación | **Largo plazo:** siempre apunta a la vertical real, **no se desvía nunca** | **Corto plazo:** cualquier vibración o sacudón lo **ensucia** (mucho ruido) |
+| **Giroscopio** | Mide la **velocidad** de giro; sumándola en el tiempo (integrando) deduce cuánto rotó | **Corto plazo:** suave, rápido, **ignora la vibración** | **Largo plazo:** acumula pequeños errores → el ángulo **se va desviando** (*drift*) |
+
+Fijate que son **complementarios**: donde uno falla, el otro anda bien. El acelerómetro es confiable en el
+largo plazo pero ruidoso; el giroscopio es confiable en el corto plazo pero deriva. **La idea genial es
+combinarlos** para quedarnos con lo bueno de cada uno. Eso es la **fusión de sensores**.
+
+### El filtro complementario, línea por línea
+La fórmula que usamos (en `task_sensor`) es:
+
 ```c
-if (s1 < SERVO_MIN_US) s1 = SERVO_MIN_US;   // 1000
-if (s1 > SERVO_MAX_US) s1 = SERVO_MAX_US;   // 2000
+roll = COMP_ALPHA * (roll + gyro_x * dt) + (1.0f - COMP_ALPHA) * accel_roll;
+//     └──────── parte del GIROSCOPIO ────┘   └──── parte del ACELERÓMETRO ────┘
+//          con COMP_ALPHA = 0.98            dt = 0.02 s (20 ms)
 ```
-Nunca se manda un pulso fuera de [1000, 2000] µs → protege el servo de errores grandes (p. ej. al arrancar).
 
----
+Traducida a palabras, cada 20 ms el nuevo ángulo se calcula así:
+1. `roll + gyro_x * dt` → tomá el **ángulo anterior** y sumale **cuánto rotó** en estos 20 ms según el
+   giroscopio (velocidad × tiempo = ángulo). Esto es rápido y suave, pero solito derivaría.
+2. Multiplicá eso por **0.98** (le damos 98% de confianza al giroscopio para el corto plazo).
+3. `accel_roll` → calculá el ángulo **absoluto** que dice la gravedad (acelerómetro). Esto es ruidoso, pero
+   no deriva.
+4. Multiplicá eso por **0.02** (solo 2%) y sumalo.
 
-## 10. Generación de PWM — subsistema MCPWM
+El 2% del acelerómetro actúa como un **ancla suave**: en cada ciclo "corrige un poquito" el ángulo hacia la
+vertical real, **cancelando el drift** del giroscopio, pero como es solo 2%, la vibración (que aparece en el
+acelerómetro) casi no se cuela. Resultado: un ángulo **rápido, suave y sin desvío**.
 
-Se usa **MCPWM** (Motor Control PWM), no `ledc`, porque permite fijar el ancho de pulso **en µs con
-resolución de 1 µs** — ideal para servos. La API nueva de ESP-IDF v6 es por **handles encadenados**:
+### ¿Por qué mejora los datos? (la intuición en frecuencias)
+Otra forma de verlo: el filtro **pasa-altos** al giroscopio (le quita el drift, que es un error "lento") y
+**pasa-bajos** al acelerómetro (le quita la vibración, que es un ruido "rápido"), y **suma** ambos. Como las
+dos mitades se complementan y suman 1 (0.98 + 0.02), no perdés ni agregás ganancia. De ahí el nombre
+**"complementario"**.
 
+Hay incluso un número que marca la frontera: la **constante de tiempo** ≈ `α·dt/(1-α)` = `0.98·0.02/0.02` ≈
+**1 segundo**. Significa: *para cambios más rápidos que ~1 s manda el giroscopio (suaviza); para cambios más
+lentos que ~1 s manda el acelerómetro (corrige el rumbo)*. Justo lo que queremos.
+
+### ¿Por qué NO usamos la media móvil (que era lo del anteproyecto y la clase)?
+La **media móvil** promedia las últimas N muestras de **un solo** sensor para suavizar el ruido. Problemas:
+usa un solo sensor (desperdicia el otro), **no arregla el drift**, e introduce **retardo** (cuanto más
+suaviza, más tarde reacciona) — malísimo para tiempo real. El complementario **fusiona los dos sensores**,
+no tiene ese retardo, y elimina el drift. Es, de hecho, la versión **simple y barata del filtro de Kalman**
+(el "de verdad", pero mucho más costoso de calcular).
+
+> ⚠️ **Ojo, punto importante para el examen:** el filtro complementario **no aparece en el material de
+> clase** (ahí se vio media móvil / FIR). Es el único concepto central "de más". Prepará esta respuesta:
+> *"Cambiamos media móvil por filtro complementario porque necesitábamos fusionar giroscopio y acelerómetro
+> para tener un ángulo sin drift y sin retardo, algo imposible con una media móvil sola."*
+
+*(Filtros digitales, FIR/IIR, media móvil: diapo `13-filtros_digitales`, lab `U3_lab1`.)*
+
+## II.9 Comunicación por buses: I2C, puerto serie (UART) y PWM
+
+El ESP32 se comunica con las otras piezas por distintos "idiomas" (protocolos). Explico los tres.
+
+### II.9.a I2C — cómo le hablamos al sensor — ❓ Tu pregunta 2
+
+> **❓ Tu pregunta 2:** *¿Qué es I2C? ¿Cómo funciona? ¿Cómo sabés que es a 50 Hz? ¿Dónde se configura? ¿Y si
+> subo ese valor? ¿Hay que corregir la gravedad o lo hace el chip? Y no entiendo nada del Paso 2 y 3.*
+
+**¿Qué es I2C?** (se lee "i-dos-ce" o "i-squared-c"). Es un **protocolo de comunicación** que conecta chips
+usando **solo dos cables**:
+- **SDA** (*Serial Data*): por donde viajan los **datos** (bits, de a uno).
+- **SCL** (*Serial Clock*): el **reloj**, un pulso que marca el **ritmo** (cada pulso = "ahora leé un bit").
+
+Analogía: dos personas pasándose un mensaje letra por letra, donde una **golpea la mesa** (SCL) para marcar
+"ahora la próxima letra", y la otra **dice la letra** (SDA) en cada golpe.
+
+**Maestro y esclavo:** uno manda (el **maestro** = ESP32) y otro obedece (el **esclavo** = MPU6050). El
+maestro **siempre genera el reloj** y decide cuándo se habla. En el mismo par de cables pueden convivir
+varios esclavos, y cada uno tiene una **dirección** única de 7 bits (como un número de casa). La del
+MPU6050 es **0x68**.
+
+**Velocidad del bus:** 400 kHz. Ese número es **cuán rápido corre el relojito SCL** (400.000 pulsos por
+segundo). **¡Ojo, no confundir con los 50 Hz!** Son dos cosas distintas:
+- **400 kHz** = velocidad del *cable* I2C (qué tan rápido se transmiten los bits de **una** lectura).
+- **50 Hz** = cada cuánto **decidimos nosotros** pedir una lectura nueva (una vez cada 20 ms).
+
+O sea: 50 veces por segundo hacemos una lectura, y **cada** lectura viaja por el cable a 400 kHz (tarda
+microsegundos). Se configura en `config.h`: la velocidad con `I2C_MASTER_FREQ_HZ 400000`.
+
+> **¿De dónde salen los 50 Hz y dónde se configuran?** **No** es algo del sensor: **lo decidimos nosotros**.
+> En `config.h` está `SENSOR_PERIOD_MS 20` (20 ms). En `task_sensor`, `vTaskDelayUntil(..., 20 ms)` hace que
+> el bucle se repita cada 20 ms → 1000/20 = **50 Hz**. El sensor por dentro mide continuamente; nosotros
+> le "sacamos una foto" cada 20 ms.
+
+> **¿Y si subo ese valor (muestreo más rápido, p.ej. 100 Hz)?** El sistema reaccionaría más rápido (más
+> correcciones por segundo). Se puede, porque cada lectura I2C tarda microsegundos y sobra tiempo dentro de
+> los 20/10 ms. **Bonus:** el `dt` del filtro se calcula solo a partir del período (`SENSOR_DT_S =
+> SENSOR_PERIOD_MS/1000`), así que la integración del giroscopio se ajusta automáticamente. Límites: más
+> frecuencia = más carga de CPU y de bus; y a partir de cierto punto no ganás nada porque el avión y los
+> servos no reaccionan tan rápido. Para retocar fino habría que reajustar `COMP_ALPHA`.
+
+> **¿Hay que corregir el efecto de la gravedad, o lo hace el chip?** **Ni una cosa ni la otra: la gravedad
+> NO se corrige, se APROVECHA.** El chip **no** la quita. El acelerómetro mide **toda** la aceleración,
+> incluida la gravedad, y justamente **usamos la gravedad** para saber hacia dónde es "abajo" y así calcular
+> la inclinación (con `atan2`). El "problema" no es la gravedad, sino las **otras** aceleraciones (vibración,
+> sacudones) que se suman y ensucian la lectura — y eso lo maneja el **filtro complementario** (apoyándose
+> en el giroscopio para el corto plazo). Resumen: gravedad = amiga (nos da la referencia); vibración =
+> enemiga (la filtra el complementario).
+
+**Ahora sí, el Paso 2 (la transacción I2C) explicado símbolo por símbolo:**
 ```
-Timer (1 MHz, 20000 ticks = 20 ms) → Operator → Comparator → Generator → GPIO
+START → dirección 0x68+W → registro 0x3B → RESTART → 0x68+R → 14 bytes → STOP
 ```
-- **Timer**: define la frecuencia (50 Hz). Resolución 1 µs/tick, periodo 20000 ticks. **Un timer por servo**.
-- **Comparator**: su valor **es el ancho de pulso en µs**. `update_cmp_on_tez = true` → el cambio se aplica
-  al inicio del periodo (evita *glitches*).
-- **Generator**: en `TIMER_EMPTY` (inicio) pone la salida **ALTA**; al llegar al comparador la pone **BAJA**.
-- Mover el servo = **cambiar el valor del comparador**:
+- **START:** el maestro "levanta la mano" y dice "voy a hablar" (una condición eléctrica especial en los
+  cables). Abre la conversación.
+- **dirección 0x68+W:** el maestro grita "¡quiero hablar con el chip 0x68, para ESCRIBIRLE!" (W = write).
+  Solo el MPU6050 responde "presente" (manda un **ACK**, un "ok").
+- **registro 0x3B:** el maestro le dice "posicioná tu puntero en tu casillero 0x3B" (ese casillero es
+  `ACCEL_XOUT_H`, donde empiezan los datos de medición). Un sensor por dentro es como una **planilla de
+  casilleros (registros)**; le indicamos desde cuál queremos leer.
+- **RESTART:** en vez de cerrar y volver a abrir, el maestro hace un "reinicio en caliente" para cambiar de
+  modo escritura a modo lectura sin soltar el bus.
+- **0x68+R:** ahora "¡quiero hablar con 0x68 para LEER!" (R = read).
+- **14 bytes:** el maestro va marcando el reloj y el sensor le va **entregando 14 bytes** seguidos (el chip
+  avanza solo su puntero de casillero: 0x3B, 0x3C, 0x3D…). Esos 14 bytes son todas las mediciones.
+- **STOP:** el maestro "baja la mano" y cierra la conversación.
+
+**¿Por qué 14 bytes?** Porque el sensor guarda cada medición en **2 bytes** (16 bits) y son 7 mediciones
+seguidas: aceleración X, Y, Z (6 bytes) + temperatura (2 bytes, que ignoramos) + giro X, Y, Z (6 bytes) =
+**14 bytes**. Los leemos todos de una sola transacción porque están en casilleros consecutivos.
+
+**El Paso 3 (reconstrucción y escalado) explicado:**
+Los 14 bytes son "crudos": bytes sueltos. Hay que convertirlos en números útiles. Dos sub-pasos:
+
+1. **Unir 2 bytes en un número de 16 bits.** Cada medición llegó partida en dos bytes: uno "alto" (los 8
+   bits de más peso) y uno "bajo". El sensor los manda en orden **big-endian** = el byte **alto primero**.
+   Los reunimos así:
+   ```c
+   int16_t acc_x = (int16_t)((raw[0] << 8) | raw[1]);
+   ```
+   - `raw[0] << 8` corre el byte alto 8 posiciones a la izquierda (lo pone en la mitad de arriba del número).
+   - `| raw[1]` le "encastra" el byte bajo en la mitad de abajo.
+   - El `(int16_t)` es **clave**: le dice a C que interprete esos 16 bits como un número **con signo**
+     (puede ser negativo). Sin eso, una inclinación negativa se leería como un número gigante positivo.
+     (Los sensores usan "complemento a dos", la forma estándar de representar negativos en binario.)
+
+2. **Escalar a unidades físicas.** Ese entero todavía no está en "g" ni en "grados/seg": es un número
+   interno del chip. El datasheet dice por cuánto dividir según el rango elegido:
+   ```c
+   out->acc_x  = acc_x / 16384.0f;   // rango ±2g   → resultado en g (gravedades)
+   out->gyro_x = gyr_x / 131.0f;     // rango ±250  → resultado en °/s (grados por segundo)
+   ```
+   ¿De dónde salen 16384 y 131? Un entero de 16 bits con signo va de −32768 a +32767. Si configuramos el
+   acelerómetro en rango ±2g, entonces +2g corresponde a ~32767, así que **1g = 32767/2 ≈ 16384**. Igual el
+   giroscopio: rango ±250°/s → 32767/250 ≈ **131** por cada °/s. Por eso dividimos por esos números:
+   convierten "cuentas internas" en unidades reales.
+
+Después de esto, tenemos la lectura en **5 números con sentido físico**: `acc_x, acc_y, acc_z` (en g) y
+`gyro_x, gyro_y` (en °/s). Listos para calcular ángulos (Parte V, Paso 4).
+
+*(I2C: laboratorio `I2C_intro`. Datasheet: `MPU-6000.PDF`.)*
+
+### II.9.b Puerto serie / UART — cómo vemos los datos — ❓ Tu pregunta 8
+
+> **❓ Tu pregunta 8:** *La tarea monitor imprime por puerto serie cada 200 ms. ¿Por qué 200? ¿Qué es un
+> puerto serie? ¿Cómo lo manejamos? ¿Tiene que ver con UART? ¿Qué es?*
+
+**¿Qué es un "puerto serie"?** Es una forma de mandar datos entre dos aparatos **bit por bit, de a uno, en
+fila** (por eso "serie", en serie uno tras otro), por un solo cable de datos. Es el modo más simple y viejo
+de comunicación entre una computadora y un dispositivo.
+
+**¿Qué es UART?** *Universal Asynchronous Receiver/Transmitter*. Es el **bloque de hardware** dentro del
+ESP32 que implementa el puerto serie: agarra un byte y lo va "sacando" bit por bit por el pin de transmisión
+(TX), y recibe bits por el pin de recepción (RX) rearmándolos en bytes. La "A" de **asíncrono** significa que
+**no hay cable de reloj** (a diferencia del I2C): en su lugar, **ambos lados acuerdan de antemano la
+velocidad**, llamada **baud rate**. Nosotros usamos **115200 baudios** (≈115200 bits por segundo). Si los
+dos lados no coinciden en esa velocidad, se ve basura.
+
+**¿Cómo llega a tu PC?** El cable USB del ESP32 tiene un chip que convierte **USB ↔ serie**. Tu PC entonces
+"ve" un puerto serie (en Linux aparece como `/dev/ttyUSB0`). Con el comando `idf.py monitor` abrís ese
+puerto y ves en la terminal lo que el ESP32 escribe.
+
+**¿Cómo lo manejamos en el código?** No manejamos el UART "a mano": usamos la función de log del ESP-IDF
+**`ESP_LOGI(...)`** (I = Info). Esa función formatea el texto y lo manda al UART0 (que es el puerto serie
+de consola). Ejemplo de lo que imprime la tarea monitor:
+```
+I (1234) MONITOR: [VUELO] Roll: +3.4° | Pitch: -1.2° | Zero(R/P): 0.0°/0.0°
+```
+(La `I` = Info, `1234` = milisegundos desde el arranque, `MONITOR` = la etiqueta de la tarea.)
+
+> **¿Por qué imprime cada 200 ms y no más seguido?** Por tres razones:
+> 1. **Para vos (humano):** 5 líneas por segundo ya es cómodo de leer. A 50 Hz (cada 20 ms) sería una
+>    catarata ilegible de texto.
+> 2. **Para no saturar:** imprimir mucho gasta CPU y llena el cable serie con datos que nadie necesita tan
+>    seguido.
+> 3. **Para no molestar al control:** la tarea monitor tiene la **prioridad más baja (3)**. Corre en los
+>    ratos libres. Aunque imprimir tarde, **nunca** le quita tiempo al sensor ni al actuador. Imprimir es lo
+>    menos urgente del sistema.
+
+*(Actuadores/señales de control y noción de comunicación: diapo `02-señales`. Puerto serie: se usa en todos
+los labs de ESP32 para ver la salida.)*
+
+### II.9.c PWM y MCPWM — cómo movemos los servos — ❓ Tu pregunta 5
+
+> **❓ Tu pregunta 5:** *¿Qué es MCPWM? ¿Cómo funciona? ¿Los servos giran para el mismo lado o están
+> invertidos? ¿Qué hay que hacer para moverlos? ¿Qué dificultades y consideraciones hay?*
+
+**¿Qué es PWM?** *Pulse Width Modulation* (modulación por ancho de pulso). Es una técnica para "comunicar un
+valor" prendiendo y apagando una señal muy rápido. Lo que importa es **cuánto tiempo está prendida** dentro
+de cada ciclo. Un servo SG90 se controla así:
+- La señal se repite cada **20 ms** (una frecuencia de **50 Hz**).
+- Dentro de esos 20 ms, el **ancho del pulso en alto** define la posición del brazo del servo:
+  - **1000 µs (1 ms) en alto → ≈ −90°**
+  - **1500 µs (1.5 ms) → 0° (centro)**
+  - **2000 µs (2 ms) → ≈ +90°**
+
+O sea: le "dibujamos" un pulso de cierto ancho y el servo mueve su brazo al ángulo correspondiente. Es como
+un idioma: "pulso de 1500 µs" significa "andá al centro".
+
+**¿Qué es MCPWM?** El ESP32 tiene un **periférico de hardware** dedicado a generar PWM para motores, llamado
+**MCPWM** (*Motor Control PWM*). Lo elegimos en vez del otro generador de PWM del ESP32 (`ledc`, pensado para
+LEDs) porque MCPWM permite fijar el ancho del pulso **en microsegundos con precisión de 1 µs**, justo lo que
+los servos necesitan. **Lo importante:** una vez configurado, MCPWM genera la señal **solo, por hardware**,
+sin gastar CPU. El procesador solo interviene para **cambiar el ancho** cuando quiere mover el servo.
+
+**¿Cómo funciona por dentro?** MCPWM se arma como una cadena de 4 bloques (por cada servo):
+```
+Timer → Operator → Comparator → Generator → pin GPIO
+```
+- **Timer:** un contador que va de 0 a 20000 y vuelve a empezar. Como cuenta a 1 MHz (1 tick = 1 µs), llegar
+  a 20000 toma 20000 µs = **20 ms**. Ese ciclo es la frecuencia de 50 Hz.
+- **Comparator (comparador):** guarda un número, p. ej. **1500**. **Ese número ES el ancho del pulso en µs.**
+- **Generator (generador):** controla el pin. Su regla: cuando el timer está en **0**, pone el pin en
+  **ALTO**; cuando el timer **llega al número del comparador (1500)**, pone el pin en **BAJO**. Resultado:
+  el pin está en alto durante **1500 µs** y en bajo el resto → ¡un pulso de 1500 µs cada 20 ms!
+
+**¿Qué hay que hacer para mover el servo?** Simplemente **cambiar el número del comparador**. Nada más:
 ```c
 void servos_set_us(uint32_t s1, uint32_t s2) {
-    mcpwm_comparator_set_compare_value(s_cmp1, clamp_us(s1));
-    mcpwm_comparator_set_compare_value(s_cmp2, clamp_us(s2));
+    mcpwm_comparator_set_compare_value(s_cmp1, s1);   // p.ej. 1550 → servo 1 se corre un poco
+    mcpwm_comparator_set_compare_value(s_cmp2, s2);
 }
 ```
-> ⚠️ **A tener presente:** esta API específica **no se vio en clase** (los labs controlaban el SG90 con
-> `gpioServo` de `pigpio` en Raspberry). El **concepto** de PWM/servo sí (`U1_lab52`, `U2_lab1`).
+El timer sigue corriendo; en el próximo ciclo el pulso ya sale con el nuevo ancho. (Usamos una opción,
+`update_cmp_on_tez`, para que el cambio se aplique justo al inicio del ciclo y no "a mitad de un pulso",
+evitando pulsos deformes.)
+
+> **¿Los dos servos giran para el mismo lado o están invertidos?** **Físicamente giran en sentidos
+> OPUESTOS**, que es lo que hace falta para corregir el **alabeo** (roll) de un ala volante: si el avión se
+> va para un lado, un alerón sube y el otro baja. **Pero en el código los dos reciben la misma orden con el
+> mismo signo** (`SERVO1_DIR = SERVO2_DIR = +1.0`). ¿Por qué funciona? Porque el **servo 2 está montado
+> físicamente al revés (espejado)** respecto del servo 1. Entonces, aunque eléctricamente les mandamos lo
+> mismo, **mecánicamente se mueven al revés uno del otro**. Los parámetros `SERVO1_DIR`/`SERVO2_DIR` existen
+> justamente para poder **invertir el sentido de un servo por software** si el montaje lo requiere, sin tocar
+> la lógica.
+
+**Dificultades y consideraciones (buenas para mencionar en el examen):**
+1. **Calibración del centro:** un servo real quizás no queda perfecto a 0° con 1500 µs. Por eso hay
+   `SERVO1_ZERO_US`/`SERVO2_ZERO_US` ajustables (p. ej. 1480 o 1520) para centrarlo sin desarmar nada.
+2. **Sentido de montaje (espejo):** ya explicado; se resuelve con `SERVOx_DIR`.
+3. **Saturación (clamping):** nunca hay que mandar un pulso fuera de 1000–2000 µs, o el servo fuerza contra
+   su tope mecánico y se puede dañar o "perder el paso". Por eso el código **recorta** siempre al rango
+   seguro antes de mandar.
+4. **Alimentación:** los servos consumen picos de corriente al moverse. Hay que alimentarlos con 5 V y
+   **masa (GND) común** con el ESP32; si no, pueden reiniciar el micro (brownout) o moverse errático.
+5. **Velocidades distintas:** dos SG90 no son idénticos; uno puede ser un pelín más lento. (De hecho el
+   proyecto tenía un modo de prueba para compararlos, que quitamos en la limpieza.)
+
+*(PWM/servos: se vio como concepto en `02-señales`, y en labs `U1_lab52`, `U2_lab1`, `U3_lab1` —aunque ahí
+con Raspberry Pi y la librería `pigpio`; la API MCPWM del ESP32 es específica de este proyecto.)*
 
 ---
+---
 
-## 11. ¿Usamos POSIX? Correspondencia POSIX ↔ FreeRTOS
+# PARTE III — EL HARDWARE PIEZA POR PIEZA
 
-**El proyecto NO usa POSIX directamente** (no hay `pthread`, `mq_send`, `pipe`, `SIGALRM`, timers POSIX).
-Corre sobre **FreeRTOS**. Pero **los conceptos** que enseñó la cátedra en POSIX se aplican con la API de
-FreeRTOS. Tenelo listo por si preguntan:
+## III.1 ESP32 (el cerebro)
+Ver **II.2**. Es el microcontrolador que ejecuta todo. Dual-core 240 MHz, 520 KB RAM, 2 MB flash. Usa sus
+periféricos I2C, MCPWM, UART y GPIO.
 
-| Concepto (visto en POSIX) | En POSIX/Linux | En este proyecto (FreeRTOS) |
+## III.2 MPU6050 (el sensor de inclinación)
+Es una **IMU** (*Inertial Measurement Unit*, unidad de medición inercial) de 6 ejes: un **acelerómetro** de
+3 ejes + un **giroscopio** de 3 ejes, en un solo chip. Se comunica por **I2C** (dirección 0x68). Lo
+configuramos con 3 escrituras al arrancar (`mpu6050_init`):
+- `PWR_MGMT_1 = 0`: lo **despierta** (arranca dormido para ahorrar energía).
+- `ACCEL_CONFIG = 0`: rango del acelerómetro **±2g** (el más sensible; suficiente para un avión).
+- `GYRO_CONFIG = 0`: rango del giroscopio **±250 °/s**.
+
+De sus 6 ejes usamos: aceleración X/Y/Z y giro X (para roll) e Y (para pitch). El giro Z (guiñada) y la
+temperatura se leen pero **se descartan** (no los necesitamos).
+
+## III.3 Servos SG90 ×2 (los músculos)
+Ver **II.9.c**. Dos micro-servos que mueven los alerones (en un ala volante se llaman **elevones** porque
+hacen de alerón + elevador). Controlados por PWM a 50 Hz, pulsos 1000–2000 µs. Servo 1 = **GPIO16** (alerón
+izquierdo), Servo 2 = **GPIO17** (alerón derecho, montado espejado).
+
+## III.4 Botón / sensor táctil (la entrada del usuario)
+Un pulsador en **GPIO19** que sirve para **fijar el punto cero** (decir "esta inclinación de ahora es el
+nivelado"). Genera una **interrupción** (ver II.5). El anteproyecto lo pensaba como sensor táctil capacitivo
+**TTP223**, pero el firmware lo trata eléctricamente como un **botón a masa (GND)**: en reposo el pin está
+en ALTO (por el pull-up interno) y al accionarlo cae a BAJO (flanco de bajada). ⚠️ *Conviene verificar en la
+maqueta qué es exactamente el módulo físico (ver Parte VI).*
+
+## III.5 Mapa de pines (conexiones)
+| Señal | GPIO | Va a |
 |---|---|---|
-| Hilo / unidad de ejecución | `pthread_create` | `xTaskCreate` |
-| Espera temporizada / periódica | `sleep`, `usleep`, timers POSIX | `vTaskDelay`, **`vTaskDelayUntil`** |
-| Exclusión mutua | `pthread_mutex_*` | `xSemaphoreCreateMutex` + `Take/Give` |
-| Sección crítica / spinlock | `pthread_spin_*` | `portENTER_CRITICAL` (`portMUX`) |
-| Cola de mensajes (IPC push) | `mq_send` / `mq_receive` | `xQueueSend` / `xQueueReceive` |
-| Señal / evento asíncrono | señales (`SIGALRM`), handlers | **ISR de GPIO** + bandera |
-| Reloj de alta resolución | `clock_gettime` | `esp_timer_get_time()` |
-
-> Nota: **procesos** (fork), **señales POSIX** e **IPC pull** (memoria compartida / archivos) se vieron
-> en clase pero **no se usan** acá: en un microcontrolador con FreeRTOS todo son **hilos** en un único
-> espacio de memoria, no hay procesos separados. Buen punto para aclarar "planificación/sincronización
-> de **procesos** no aplica; sí de **hilos/tareas**".
+| I2C SDA / SCL | 21 / 22 | MPU6050 (datos / reloj) |
+| PWM Servo 1 / 2 | 16 / 17 | SG90 izquierdo / derecho |
+| Botón (interrupción) | 19 | Pulsador / táctil |
+| GND y 3.3V / 5V | — | Masa común y alimentación |
 
 ---
-
-## 12. Manejo del tiempo
-
-- **Tick de FreeRTOS**: 1 ms (1000 Hz).
-- **Muestreo periódico exacto**: `vTaskDelayUntil` (sensor 20 ms, monitor 200 ms).
-- **Tiempo absoluto en µs**: `esp_timer_get_time()` (usable dentro de la ISR, no toca el scheduler) para
-  el **antirrebote** de 300 ms.
-- **Timeouts** como mecanismo de robustez: cola (100 ms), mutex (10 ms), transacción I2C (100 ms).
-
 ---
 
-## 13. Flujo de arranque (`app_main`)
+# PARTE IV — EL SOFTWARE
+
+## IV.1 Estructura de archivos y guía de lectura
+
+El proyecto son **5 módulos**. En C, cada módulo suele tener dos archivos: un **`.c`** (la implementación, el
+código de verdad) y un **`.h`** (el "índice" o **contrato**: solo declara qué funciones existen, para que
+otros archivos las usen sin ver el código interno). Separar en módulos hace el código **más fácil de
+estudiar**: cada archivo es **un solo tema**.
+
+**Leelos en este orden:**
+
+| Orden | Archivo | Qué mirar | Prioridad |
+|:---:|---|---|:---:|
+| 1️⃣ | **`config.h`** | El "tablero de control": todos los números ajustables (pines, escalas, ganancia, α, prioridades). Sin lógica. | ⭐⭐⭐ |
+| 2️⃣ | **`main.c`** | El arranque: `app_main()` con los 5 pasos de inicialización. ~40 líneas. | ⭐⭐ |
+| 3️⃣ | **`mpu6050.c`** (+`.h`) | Cómo se lee el sensor por I2C y se escala. | ⭐⭐ |
+| 4️⃣ | **`tasks.c`** (+`.h`) | ⭐ **EL ARCHIVO CLAVE:** las 3 tareas + la ISR + toda la sincronización + el filtro + el control. **Es lo que más te van a preguntar.** | ⭐⭐⭐ |
+| 5️⃣ | **`servos.c`** (+`.h`) | Cómo se genera el PWM con MCPWM. | ⭐⭐ |
+
+**Si tenés poquísimo tiempo:** `config.h` + `tasks.c`. Con esos dos entendés el 80%.
+
+**Dentro de `tasks.c`, leé en este orden:** (1) las variables globales de sincronización, (2) `gpio_isr_handler`
+(la ISR), (3) `task_sensor`, (4) `task_actuator`, (5) `task_monitor`, (6) `tasks_sync_init`/`tasks_start`.
+
+> **Nota "modo estudio":** esta versión fue limpiada de código que no se ejecutaba (se quitaron `gyro_z` sin
+> usar, la rama de control de pitch, y dos modos de prueba de hardware). Así `main.c` quedó en ~40 líneas y el
+> actuador sin ramas condicionales, sin afectar nada de la lógica evaluable.
+
+## IV.2 Las 3 tareas + la ISR (resumen)
+
+| Elemento | Prioridad | Cuándo corre | Qué hace |
+|---|:---:|---|---|
+| `task_sensor` | 5 | cada 20 ms (`vTaskDelayUntil`) | Lee MPU → calcula ángulos → **filtro complementario** → atiende el botón → publica en la cola |
+| `task_actuator` | 7 | cuando llega dato a la cola | Recibe ángulo → calcula error vs punto cero → **control P** → mueve servos |
+| `task_monitor` | 3 | cada 200 ms | Imprime estado por puerto serie |
+| ISR del botón | HW (máx) | al accionar GPIO19 | Levanta la bandera "recalibrar punto cero" (nada más) |
+
+## IV.3 El control proporcional (P)
+
+Cuando el actuador recibe el ángulo, calcula el **error** (cuánto se desvió del nivelado) y aplica una
+corrección **proporcional** a ese error:
+```c
+float error_roll = data.roll - z_roll;                        // desvío respecto al punto cero
+float s1 = 1500 + SERVO1_DIR * error_roll * CONTROL_GAIN;      // CONTROL_GAIN = 10 µs por grado
+float s2 = 1500 + SERVO2_DIR * error_roll * CONTROL_GAIN;
 ```
-1. mpu6050_i2c_init()  → configura bus I2C maestro (GPIO21/22, 400 kHz)
-2. mpu6050_init()      → despierta el sensor (PWR_MGMT_1=0), rangos ±2g / ±250°/s
-3. servos_init()       → cadena MCPWM ×2, servos al neutro (1500 µs)
-4. tasks_sync_init()   → crea cola + mutex, configura GPIO19 e instala la ISR
-5. tasks_start()       → crea las 3 tareas; el scheduler toma el control
-```
-Cada paso va envuelto en `ESP_ERROR_CHECK(...)`: si algo falla, **pánico controlado** con mensaje claro
-en vez de seguir con hardware mal inicializado. Al retornar `app_main`, su tarea se elimina y el resto sigue.
+- Si el error es 0 (avión nivelado), los servos quedan en 1500 µs (centro).
+- Si el error es 5°, la corrección es 5 × 10 = 50 µs → servo a 1550 µs.
+- Es un controlador **"P puro"** (solo Proporcional, sin las partes Integral ni Derivativa de un PID
+  completo). Para estabilizar una maqueta es suficiente: cuanto más inclinado, más corrige; a medida que se
+  endereza, corrige menos. **Lazo cerrado.**
 
----
+## IV.4 config.h — los parámetros que podés tocar
 
-## 14. Estructura del proyecto
-```
-STR_ENTREGA/
-├── CMakeLists.txt          # raíz ESP-IDF → project(ala_volante_rtos)
-├── sdkconfig(.defaults)    # tick 1000 Hz, IRAM GPIO, flash 2 MB, I2C legacy
-└── main/
-    ├── CMakeLists.txt      # SRCS + REQUIRES (driver, esp_driver_gpio/mcpwm, esp_timer)
-    ├── config.h            # TODOS los parámetros (pines, ganancias, prioridades…)
-    ├── main.c              # app_main: los 5 pasos de arranque (~40 líneas)
-    ├── mpu6050.[ch]        # driver I2C del sensor
-    ├── servos.[ch]         # control MCPWM de los 2 servos
-    └── tasks.[ch]          # las 3 tareas + ISR + objetos de sincronización
-```
-Todo parámetro ajustable está **centralizado en `config.h`** (buena práctica: un solo lugar para tocar
-pines, ganancia, α del filtro, prioridades, etc.).
+Todo se ajusta desde un solo archivo. Los más importantes:
 
-> **Nota "modo estudio":** la versión que estás estudiando fue limpiada de código que no se ejecutaba
-> (se quitaron `gyro_z` sin usar, la rama de control de pitch, y los dos modos de prueba de hardware
-> `BUTTON_TEST_MODE`/`SERVO_TEST_MODE`). Eso deja `main.c` en ~40 líneas y el actuador sin ramas
-> condicionales, sin afectar nada de la lógica de tiempo real evaluable.
-
----
-
-## 14.1 Sistema de compilación: CMake, CMakeLists y sdkconfig
-
-Estas cuatro piezas **no son código del proyecto**, son la "maquinaria" que ESP-IDF necesita para
-compilar. Conviene saber qué es cada una porque el profesor puede preguntar por qué están ahí.
-
-### ¿Qué es CMake?
-Es un **generador de sistema de compilación**. No compila directamente: vos describís el proyecto (qué
-archivos hay y de qué dependen) en archivos `CMakeLists.txt`, y **CMake genera** los archivos que el
-compilador real va a usar (en ESP-IDF genera archivos de **Ninja**, que es quien finalmente llama a `gcc`).
-
-Cadena completa al hacer `idf.py build`:
-```
-idf.py build
-   → CMake lee los CMakeLists.txt y genera build.ninja
-       → Ninja llama a xtensa-esp32-elf-gcc para compilar cada .c
-           → el linker arma el .elf → esptool lo convierte en .bin flasheable
-```
-> Analogía: `CMakeLists.txt` es la **receta**; **CMake** es el cocinero que la lee y prepara las
-> instrucciones; **Ninja/gcc** son quienes cocinan.
-
-### Los dos `CMakeLists.txt` (obligatorios)
-
-**`CMakeLists.txt` (raíz)** — punto de entrada, 3 líneas:
-```cmake
-cmake_minimum_required(VERSION 3.16)
-include($ENV{IDF_PATH}/tools/cmake/project.cmake)   # trae TODA la maquinaria de ESP-IDF
-project(ala_volante_rtos)                            # nombre del proyecto
-```
-
-**`main/CMakeLists.txt`** — registra tu código:
-```cmake
-idf_component_register(
-    SRCS "main.c" "mpu6050.c" "servos.c" "tasks.c"              # qué archivos compilar
-    INCLUDE_DIRS "."
-    REQUIRES driver esp_driver_gpio esp_driver_mcpwm esp_timer  # de qué componentes depende
-)
-```
-Acá le decís a ESP-IDF **cuáles son tus `.c`** y **qué módulos del SDK usás** (I2C, GPIO, MCPWM, timer).
-
-**¿Se pueden sacar?** ❌ **No, son obligatorios.** Sin ellos ESP-IDF ni siquiera reconoce la carpeta como
-un proyecto: **no compila**. Son tan esenciales como el propio código.
-
-### `sdkconfig.defaults` vs `sdkconfig`
-
-| Archivo | Qué es | ¿Va en git? | ¿Se puede sacar? |
-|---|---|---|---|
-| **`sdkconfig.defaults`** | **Fuente** (34 líneas, escrito a mano). Las opciones del SDK que cambiamos respecto al default de fábrica. ESP-IDF lo lee **por convención** para generar el `sdkconfig`. | ✅ Sí | ❌ No conviene (ver abajo) |
-| **`sdkconfig`** | **Generado** (~3700 líneas, dice "DO NOT EDIT"). Se recrea solo a partir de `sdkconfig.defaults` + `menuconfig` en cada build. | ❌ No (lo pusimos en `.gitignore`) | ✅ Sí, se regenera solo |
-
-**Opciones clave que fija `sdkconfig.defaults`** (por eso NO se saca):
-
-| Opción | Qué hace | Si lo sacás… |
+| Parámetro | Valor | Qué controla |
 |---|---|---|
-| `CONFIG_FREERTOS_HZ=1000` | **Tick de FreeRTOS = 1 ms** | Vuelve al default (**100 Hz = 10 ms**): peor resolución temporal y más *jitter*. En un sistema de **tiempo real** es justo lo que no querés. |
-| `CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y` | Driver GPIO en RAM → **ISR de baja latencia** | La ISR del pulsador podría tardar más. |
-| `CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y` | Declara **2 MB de flash** (tu módulo) | Podría asumir otro tamaño y fallar al flashear. |
-| `CONFIG_I2C_SUPPRESS_DEPRECATE_WARN=y` | Silencia el aviso de API I2C legacy | Cosmético: vuelven los warnings. |
-
-> **En una frase:** `sdkconfig.defaults` es la **memoria escrita** de las decisiones de configuración del
-> proyecto (sobre todo el tick de 1 kHz que sostiene el tiempo real). Compila igual sin él, pero el
-> comportamiento temporal cambiaría → por eso se versiona y se mantiene.
-
-*(Todo esto también está en `DOCUMENTACION.md` §6, §16 y §18.)*
+| `SENSOR_PERIOD_MS` | 20 | Período de muestreo (→ 50 Hz) |
+| `COMP_ALPHA` | 0.98 | Peso del giroscopio en el filtro (0.98 = 98%) |
+| `CONTROL_GAIN` | 10.0 | Cuántos µs corrige por grado de error |
+| `SERVOx_ZERO_US` | 1500 | Centro de cada servo (calibración física) |
+| `SERVOx_DIR` | +1.0 | Sentido de cada servo (invertir con −1.0) |
+| `PRIO_*` | 5/7/3 | Prioridades de las tareas |
+| `BUTTON_DEBOUNCE_US` | 300000 | Antirrebote del botón (300 ms) |
+| `I2C_MASTER_FREQ_HZ` | 400000 | Velocidad del bus I2C |
 
 ---
-
-## 15. Requisito de tiempo real (cómo se cumple)
-
-- **Restricción dura del Anteproyecto:** un retraso implica perder el control del avión.
-- **Garantía del diseño:** el lazo *medir → filtrar → publicar → corregir* cierra en **≤ 20 ms** (50 Hz).
-  El actuador tiene **prioridad mayor** que el sensor, así que la corrección ocurre apenas hay dato; la
-  ISR (máxima prioridad de HW) redefine el cero al instante.
-- **Métrica de validación (Anteproyecto §4):** (1) con vibración, la consola muestra ángulos **estables,
-  sin picos** (mérito del filtro); (2) al tocar el sensor, el sistema **fija el nuevo 0** al instante;
-  (3) inclinación en roll → servos se mueven (opuestos mecánicamente); pitch → mismo sentido (si se
-  activara el control de pitch).
-
 ---
 
-## 16. Preguntas probables del profesor (y respuesta corta)
+# PARTE V — RECORRIDO PASO A PASO (de la vibración al servo)
 
-1. **¿Este filtro lo vieron en clase?** — En clase vimos media móvil (FIR). Acá usamos **filtro
-   complementario** (fusión giro+acelerómetro), que resuelve el drift y la vibración sin el retardo de la
-   media móvil; es la alternativa liviana al Kalman. *(Es la desviación principal — tenela sólida.)*
-2. **¿Por qué el actuador tiene más prioridad que el sensor?** — Porque cierra el lazo de control y es lo
-   crítico en tiempo; apenas hay dato, desaloja al sensor y corrige.
-3. **¿Por qué `vTaskDelayUntil` y no `vTaskDelay`?** — Para muestreo periódico **exacto** (instante
-   absoluto), sin acumular deriva por el tiempo variable de la lectura I2C.
-4. **¿Por qué la ISR solo levanta una bandera?** — Debe ser mínima y no bloqueante; el trabajo (con mutex)
-   lo hace la tarea con el ángulo fresco del próximo ciclo. Patrón evento→tarea.
-5. **¿Mutex vs spinlock, por qué los dos?** — Spinlock (`portMUX`) para el tramo cortísimo que también
-   toca la ISR (no puede dormir) y por ser dual-core; mutex para `zero_*` entre tareas que sí pueden esperar.
-6. **¿Usan procesos o hilos? ¿POSIX?** — Hilos (tareas FreeRTOS), un solo espacio de memoria. No POSIX
-   directo; los conceptos POSIX se mapean a la API FreeRTOS (ver §11).
-7. **¿Por qué MCPWM y no LEDC?** — Resolución en µs y actualización sin glitches, natural para servos.
-8. **¿Por qué controlan un solo eje si el Anteproyecto decía dos?** — Decisión de alcance: para un ala
-   volante el **roll** es el eje natural de los alerones. El **pitch se mide y se reporta**, pero no se
-   corrige.
-9. **¿El pulsador es capacitivo o botón?** — *(Verificá el hardware real.)* Eléctricamente el firmware lo
-   trata como botón a GND (pull-up + flanco de bajada). Si es un TTP223 estándar (activo en alto), habría
-   que revisar el flanco/pull.
-10. **¿Para qué sirven los `CMakeLists.txt` y `sdkconfig.defaults`?** — Los `CMakeLists.txt` le dicen a
-    ESP-IDF qué archivos compilar y de qué depende el proyecto (son obligatorios: sin ellos no compila).
-    `sdkconfig.defaults` fija las opciones del SDK que necesitamos, sobre todo el **tick de FreeRTOS a
-    1 kHz** que sostiene el tiempo real. El `sdkconfig` grande es generado y no se versiona. (Ver §14.1.)
+Ahora seguimos **un dato** en su viaje completo, reexplicado con todo el contexto de las partes anteriores.
+Es el mismo flujo que se repite **50 veces por segundo**. En cada paso digo **qué pasa** y **qué viaja** al
+siguiente.
+
+### 🔵 El lazo de control (el corazón, 50 veces por segundo)
+
+**Paso 1 — El avión se inclina.** Viento, vibración del motor o una mano lo mueven. El **MPU6050**, pegado
+al avión, siente dos cosas a la vez: la **aceleración** (que incluye la gravedad) y la **velocidad de giro**.
+*Contexto:* ver II.7 (señales) y III.2 (sensor).
+
+**Paso 2 — `task_sensor` lee el sensor por I2C** (cada 20 ms, porque tiene `vTaskDelayUntil` a 20 ms).
+Llama a `mpu6050_read()`, que hace la transacción I2C `START → 0x68+W → 0x3B → RESTART → 0x68+R → 14 bytes →
+STOP`. *(Si no entendés esta línea, está explicada símbolo por símbolo en **II.9.a**.)* El ESP32 es el
+maestro, marca el reloj por SCL y recibe los datos por SDA.
+→ **Viaja:** 14 bytes crudos (`uint8_t raw[14]`).
+
+**Paso 3 — Reconstrucción y escalado** (dentro de `mpu6050_read`). Los 14 bytes se juntan de a dos para
+formar 7 números de 16 bits con signo, y se dividen por los factores del datasheet (16384 para g, 131 para
+°/s). *(Detalle completo en **II.9.a**, "el Paso 3 explicado".)*
+→ **Viaja:** un `mpu6050_reading_t` = **5 números físicos**: `acc_x/y/z` (en g) y `gyro_x/y` (en °/s).
+
+**Paso 4 — Calcular dos versiones del ángulo** (en `task_sensor`):
+- **Por el acelerómetro** (usando la gravedad): `accel_roll = atan2(acc_y, acc_z)` → da grados. `atan2` es
+  una función trigonométrica que, dados los dos componentes del vector gravedad, devuelve el ángulo de
+  inclinación (funciona en todos los cuadrantes, con signo). Es **exacta pero ruidosa**.
+- **Por el giroscopio** (integrando): tomar el ángulo anterior y sumarle `gyro_x · dt` (velocidad × tiempo).
+  Es **suave pero deriva**.
+→ **Viaja:** dos estimaciones del mismo ángulo, con defectos opuestos. *(Ver II.8.)*
+
+**Paso 5 — Filtro complementario** (el "cerebro"). Fusiona las dos estimaciones:
+```c
+roll = 0.98*(roll + gyro_x*0.02) + 0.02*accel_roll;
+```
+98% giroscopio (rápido, ignora vibración) + 2% acelerómetro (ancla que borra el drift). *(Explicado a fondo
+en II.8.)*
+→ **Viaja:** el **ángulo limpio** `roll` (y `pitch`), en grados.
+
+**Paso 6 — Publicar en la cola** (en `task_sensor`):
+```c
+imu_data_t data = { .roll = roll, .pitch = pitch };
+xQueueSend(imu_queue, &data, 0);   // el "0" = no esperar; si está llena, descarta la muestra
+```
+La cola desacopla al sensor del actuador. *(Ver II.6.c.)*
+→ **Viaja:** una **copia** del struct por dentro de la cola `imu_queue`.
+
+**Paso 7 — El actuador se despierta.** `task_actuator` (prioridad 7, alta) estaba **dormido** esperando en
+`xQueueReceive`. Al llegar el dato, se despierta y —por tener más prioridad que el sensor— el planificador
+**desaloja al sensor** y lo pone a correr **ya**. *(Ver II.4, preemption.)*
+→ **Viaja:** el struct con el ángulo.
+
+**Paso 8 — Calcular el error y la corrección** (control proporcional):
+```c
+float z_roll = zero_roll;                        // el "nivelado" de referencia (leído bajo mutex)
+float error_roll = data.roll - z_roll;           // cuánto está desviado
+float s1 = 1500 + SERVO1_DIR * error_roll * 10;  // 10 µs de corrección por grado
+float s2 = 1500 + SERVO2_DIR * error_roll * 10;
+```
+*(Ver IV.3.)* → **Viaja:** dos anchos de pulso `s1`, `s2` en µs.
+
+**Paso 9 — Saturar (clamping).** Se recorta cada pulso al rango seguro `[1000, 2000]` µs para no dañar el
+servo. *(Ver II.9.c, dificultad 3.)*
+
+**Paso 10 — Ordenar a los servos.** `servos_set_us(s1, s2)` cambia el **número del comparador** de cada canal
+MCPWM. *(Ver II.9.c.)* → **Viaja:** el nuevo ancho de pulso al hardware MCPWM.
+
+**Paso 11 — El hardware genera el PWM** (sin CPU). El timer cuenta 0→20000 (20 ms); pone el pin en ALTO al
+inicio y en BAJO al llegar al comparador (p. ej. 1550). Sale un pulso de 1550 µs cada 20 ms por GPIO16/17.
+→ **Viaja:** una señal eléctrica PWM por el cable de señal del servo.
+
+**Paso 12 — El servo se mueve.** El SG90 traduce el ancho del pulso en un ángulo del brazo → mueve el alerón
+→ **corrige la inclinación**. El avión se endereza → en el próximo ciclo el error es menor → el servo se
+mueve menos. Y vuelta a empezar. **Eso es el lazo cerrado.**
+
+> **Todo esto (pasos 2 a 12) ocurre en muchísimo menos de 20 ms, 50 veces por segundo.** Ese margen es lo que
+> hace que el sistema cumpla el requisito de tiempo real.
+
+### 🟡 Flujo secundario 1 — Fijar el punto cero (cuando apretás el botón)
+1. Accionás el botón → **flanco de bajada en GPIO19** → el hardware dispara la **ISR** `gpio_isr_handler`.
+2. La ISR (mínima) revisa el antirrebote (300 ms) y **solo** hace `zero_reset_requested = true` (protegido
+   por el spinlock). Termina en microsegundos. *(Ver II.5.)*
+3. En su próximo ciclo, `task_sensor` ve la bandera, toma el mutex y hace `zero_roll = roll; zero_pitch =
+   pitch;` → **la inclinación actual se vuelve el nuevo "nivelado"**.
+4. Desde ahí, el error del Paso 8 se mide contra ese nuevo cero.
+
+### 🟢 Flujo secundario 2 — Monitoreo (cada 200 ms)
+1. `task_monitor` (prioridad 3, baja) lee el último ángulo (bajo spinlock) y el punto cero (bajo mutex).
+2. Los imprime por **UART0** con `ESP_LOGI` → los ves en la consola (`idf.py monitor`, 115200 baud). *(Ver
+   II.9.b.)*
+3. Por ser la de menor prioridad, **nunca** estorba al control.
+
+### Mapa de "quién le habla a quién"
+```
+                    ┌──────────── zero_reset (spinlock) ────────────┐
+   Botón ──────ISR──> [bandera] ──> task_sensor                     │
+   (GPIO19)                            │  (lee I2C, calcula ángulo,  │
+                                       │   filtra)                   │
+   MPU6050 ──I2C──> task_sensor ──imu_queue(copia)──> task_actuator ─┴─> servos_set_us ──PWM──> SG90 x2
+                        │                                 │
+                        ├── zero_roll/pitch (mutex) ──────┤   (punto cero compartido)
+                        └── last_roll/pitch (spinlock) ─> task_monitor ──UART──> Consola PC
+```
+Leído en palabras: el **botón** avisa por una bandera; el **sensor** lee el MPU por I2C, filtra y manda el
+ángulo por la **cola** al **actuador**, que mueve los **servos** por PWM; en paralelo, el **monitor** lee las
+variables compartidas y las imprime por el **puerto serie**. Las líneas de mutex/spinlock son las
+protecciones para que nadie pise a nadie.
 
 ---
+---
 
-## 17. Cosas a arreglar/verificar antes de presentar
+# PARTE VI — CONTEXTO ACADÉMICO (para defender decisiones)
 
-**Ya resueltas en esta versión** (parte del "modo estudio"):
-- ✅ Comentario erróneo de la ISR en `tasks.c` ("flanco positivo" → corregido a **negativo/bajada**).
-- ✅ Comentario "pull-down" en `main.c`: desapareció al quitar el modo de prueba del botón.
-- ✅ `DOCUMENTACION.md` §3.4 y nota de pines: reescritas para describir el pulsador tal como lo trata
-  el código (pull-up interno + flanco de bajada).
+## VI.1 ¿Todo lo implementado lo vimos en la cursada?
 
-**Pendientes / a tener en cuenta:**
-1. **Coherencia física del pulsador.** El firmware trata GPIO19 como **entrada activa en bajo**
-   (reposo ALTO, se acciona a GND, flanco de bajada). Un TTP223 estándar es *activo en alto*: si el
-   módulo real es capacitivo, verificá que esté jumpereado como activo-bajo o que efectivamente sea un
-   botón a GND. En la maqueta se comprueba tocando y viendo si el "punto cero" se fija.
-2. **Cambio de filtro** (media móvil → complementario) respecto al Anteproyecto: preséntalo como una
-   **mejora justificada** (ver §5.5), no como un olvido.
+**Casi todo sí.** Lo verifiqué contra las diapositivas y laboratorios. Excepciones a tener presentes:
 
-*(Nada de esto afecta el funcionamiento; son de coherencia/documentación.)*
+| Elemento | ¿Visto en clase? | Dónde / nota |
+|---|---|---|
+| RTOS, tareas, prioridades, preemption | ✅ | `12-rtos`, `01-...`, `FreeRTOS.pdf` |
+| `xTaskCreate`, `vTaskDelayUntil` | ✅ | `FreeRTOS.pdf` |
+| Colas productor-consumidor | ✅ | `U3_lab4` |
+| Mutex, semáforos, ISR con semáforo | ✅ | `08-sinc_hilos`, `U3_lab3` |
+| Sección crítica / spinlock | ✅ | `08-sinc_hilos`, `12-rtos` |
+| I2C (maestro/esclavo, SDA/SCL, direcciones) | ✅ | `I2C_intro` |
+| MPU6050 (IMU) | ✅ | `U3_lab1` (usa MPU6050) |
+| PWM / servo SG90 | ✅ | `U1_lab52`, `U2_lab1`, `U3_lab1` |
+| Filtro digital, FIR/IIR, **media móvil** | ✅ | `13-filtros_digitales`, `U3_lab1` |
+| **Filtro complementario + `atan2`** | ❌ **NO** | *No está en ningún material.* Es la técnica que reemplazó a la media móvil. **Preparar esta respuesta (ver II.8).** |
+| **API MCPWM del ESP32** | ⚠️ Parcial | El *concepto* PWM/servo sí; **esta API concreta no** (los labs usaban `pigpio` en Raspberry). |
+| **API I2C del ESP-IDF** | ⚠️ Parcial | El *protocolo* I2C sí; **esta API concreta no** (el lab era con `pigpio`). |
+
+**Detalle clave — µC/OS vs FreeRTOS y POSIX vs FreeRTOS:** buena parte de la teoría fue con **µC/OS-III** y
+con **POSIX en Raspberry Pi** (pthreads, colas POSIX, timers POSIX). El proyecto usa **FreeRTOS en ESP32**,
+que aplica **los mismos conceptos con otra API**. La correspondencia:
+
+| Concepto (teoría POSIX/µC/OS) | En el proyecto (FreeRTOS) |
+|---|---|
+| Hilo / tarea | `xTaskCreate` |
+| Espera periódica | `vTaskDelayUntil` |
+| Mutex | `xSemaphoreCreateMutex` |
+| Cola de mensajes | `xQueueSend`/`xQueueReceive` |
+| Sección crítica / spinlock | `portENTER_CRITICAL` (`portMUX`) |
+| Señal/evento | ISR de GPIO + bandera |
+| Reloj de alta resolución | `esp_timer_get_time()` |
+
+> Nota: **no usamos procesos ni señales POSIX**: en un microcontrolador con FreeRTOS todo son **tareas
+> (hilos)** en un único espacio de memoria. Si preguntan por "procesos", la respuesta es que acá aplica el
+> modelo de **hilos/tareas**, no de procesos separados.
+
+## VI.2 ¿Coincide con el Anteproyecto?
+
+Objetivo y hardware: **sí**. Tres desviaciones deliberadas a saber justificar:
+1. **Filtro:** el anteproyecto decía media móvil; implementamos **complementario** (mejor, ver II.8).
+2. **Ejes:** el anteproyecto quería corregir dos ejes; corregimos **solo roll** (el pitch se mide y reporta).
+   Es el eje natural de los alerones en un ala volante.
+3. **Tareas:** el anteproyecto separaba "productor (lee) / consumidor (filtra) / actuación"; en la práctica el
+   sensor **lee y filtra**, el actuador **consume y mueve**, y agregamos un **monitor**. Mismo espíritu
+   productor-consumidor.
+
+## VI.3 Sobre la documentación técnica previa
+
+El proyecto tenía una `DOCUMENTACION.md` generada por IA. Se **consolidó todo su contenido útil en esta
+guía** (que además lo explica desde cero y más a fondo), así que se eliminó para no mantener dos documentos
+en paralelo que se desincronizan. Durante esa consolidación se detectaron y **corrigieron** algunas
+inconsistencias entre aquella doc y el código: el comentario erróneo de la ISR ("flanco positivo" → es
+flanco de bajada), un comentario "pull-down" que era pull-up, y la descripción enrevesada del pulsador.
+**Queda un solo punto a verificar contra el hardware:** si el pulsador físico es un botón a GND o un TTP223
+configurado como activo-bajo (ver §III.4 y §VIII).
+
+## VI.4 Sistema de compilación: CMake y sdkconfig
+
+Estas piezas no son "código del proyecto" sino la **maquinaria** para compilar.
+
+- **CMake** es un **generador de sistema de compilación**: vos describís el proyecto en archivos
+  `CMakeLists.txt` y CMake genera las instrucciones que usa el compilador. Cadena: `idf.py build` → CMake →
+  Ninja → `gcc` compila → se arma el `.bin` → `esptool` lo graba.
+- Los **`CMakeLists.txt`** (uno en la raíz, otro en `main/`) le dicen a ESP-IDF **qué archivos compilar** y
+  **de qué componentes depende**. Son **obligatorios**: sin ellos no compila.
+- **`sdkconfig.defaults`** (34 líneas, fuente, va en git): fija las opciones del SDK que necesitamos, sobre
+  todo **`CONFIG_FREERTOS_HZ=1000`** (tick de 1 ms, base del tiempo real), el tamaño de flash y la IRAM para
+  la ISR. **No conviene sacarlo:** sin él, el tick vuelve a 100 Hz y cambia el comportamiento temporal.
+- **`sdkconfig`** (~3700 líneas, dice "DO NOT EDIT"): es **generado** a partir de `sdkconfig.defaults`; se
+  recrea solo en cada build, por eso **no se versiona** (lo pusimos en `.gitignore`).
+
+---
+---
+
+# PARTE VII — PROFUNDIZACIÓN (detalles finos para puntos extra)
+
+Esta parte junta detalles que **no hacen falta para entender el sistema**, pero que **suman mucho** si el
+profesor "escarba" en un tema. Cada uno profundiza un concepto ya visto.
+
+## VII.1 I2C a fondo: el byte de dirección y el ACK/NACK  [amplía §II.9.a]
+
+En §II.9.a vimos la transacción a grandes rasgos. Dos detalles finos que están en el código:
+
+**(a) El byte de dirección lleva la dirección Y el bit de lectura/escritura juntos.** En el código verás:
+```c
+i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+```
+La dirección I2C es de **7 bits** (0x68), pero se transmite un **byte de 8 bits**: los 7 bits de dirección
+van arriba y el **bit 0 indica la operación** (0 = escribir, 1 = leer). Por eso se hace `MPU6050_ADDR << 1`
+(corre la dirección un lugar a la izquierda para dejar libre el bit 0) y luego se le pega el bit de R/W:
+- Escritura: `0x68 << 1 | 0` = **0xD0**
+- Lectura:  `0x68 << 1 | 1` = **0xD1**
+
+**(b) Cada byte se confirma con un ACK; el último de una lectura, con NACK.** En I2C, después de cada byte
+el receptor manda un bit de **ACK** ("recibido, seguí") o **NACK** ("no"). Fijate en el código de lectura:
+```c
+i2c_master_read(cmd, buf, len - 1, I2C_MASTER_ACK);      // todos menos el último: ACK
+i2c_master_read_byte(cmd, &buf[len - 1], I2C_MASTER_NACK); // el último: NACK
+```
+El maestro pone **NACK en el último byte** para decirle al sensor **"ya no quiero más datos"**; sin eso, el
+sensor seguiría entregando. Es la forma de cerrar la lectura ordenadamente.
+
+**(c) El "RESTART" (repeated start).** Entre escribir el registro y leer los datos, en vez de hacer STOP y
+un nuevo START (que soltaría el bus y otro maestro podría meterse), se hace un **RESTART**: un START nuevo
+sin soltar el bus. Garantiza que la lectura es **atómica** respecto a la escritura del registro.
+
+**(d) `i2c_cmd_link`.** El driver legacy de ESP-IDF arma la transacción como una **lista de comandos**
+(`i2c_cmd_link_create` → agregar START, bytes, STOP → `i2c_master_cmd_begin` la ejecuta de una). Es como
+escribir la "receta" de la transacción y después mandarla a ejecutar toda junta.
+
+## VII.2 Los stacks de las tareas: "palabras" vs bytes  [amplía §II.4]
+
+Al crear una tarea le damos un **stack** (pila): la memoria privada donde guarda sus variables locales y el
+"rastro" de las funciones que va llamando. En `config.h`:
+```c
+#define STACK_SENSOR   4096   // ¡en PALABRAS (words), no en bytes!
+```
+Detalle fino: FreeRTOS mide el stack en **palabras**, no en bytes. En el ESP32 (arquitectura de 32 bits) **1
+palabra = 4 bytes**, así que `4096 palabras = 16 KB`. ¿Por qué tanto? Porque `task_sensor` llama a funciones
+matemáticas (`atan2f`, `sqrtf`) que usan bastante stack, y **quedarse corto de stack (stack overflow)
+corrompe la memoria y cuelga el sistema**. Por eso se da un margen holgado. El monitor usa menos (3072)
+porque solo imprime.
+
+## VII.3 `IRAM_ATTR` y por qué importa la caché  [amplía §II.5]
+
+Vimos que la ISR se marca `IRAM_ATTR` para "baja latencia". El detalle de por qué: normalmente el programa
+vive en la **flash** y el CPU lo ejecuta a través de una **caché** de instrucciones. Si justo la instrucción
+que necesita **no está en la caché** (un *cache miss*), el CPU tiene que **ir a buscarla a la flash**, lo que
+tarda **cientos de nanosegundos** — un tiempo **impredecible**. En un sistema de tiempo real, "impredecible"
+es una mala palabra. Al poner la ISR en **IRAM** (RAM interna), **siempre está disponible al instante**, con
+latencia mínima y **determinística**. Por eso las ISR (y otras rutinas críticas) se ponen en IRAM. Esto se
+apoya en la opción `CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y` del `sdkconfig.defaults`.
+
+## VII.4 MCPWM sin glitches y el dibujo del pulso  [amplía §II.9.c]
+
+Un detalle clave de la configuración del comparador:
+```c
+mcpwm_comparator_config_t cmp_config = { .flags.update_cmp_on_tez = true };
+```
+`update_cmp_on_tez` = "actualizar el comparador cuando el timer llega a cero" (*Timer Event Zero*). ¿Por qué
+importa? Si cambiáramos el ancho del pulso **en mitad de un pulso**, ese pulso saldría deforme (más corto o
+más largo de lo debido) — un **glitch** que haría "temblar" al servo. Al aplicar el cambio **solo al inicio
+del próximo período**, cada pulso sale siempre completo y limpio.
+
+Visualmente, un pulso de 1500 µs dentro del período de 20000 µs se ve así:
+```
+GPIO: ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+      ←── 1500 µs en ALTO ──→←──────── 18500 µs en BAJO ─────────→
+      ←──────────────────── 20000 µs (un período, 50 Hz) ─────────→
+```
+El generador pone el pin en ALTO cuando el timer está en 0, y en BAJO cuando llega a 1500. Mover el servo =
+cambiar ese 1500.
+
+## VII.5 Robustez del arranque: `ESP_ERROR_CHECK`  [amplía §IV / arranque]
+
+En `main.c`, cada paso de inicialización va envuelto así:
+```c
+ESP_ERROR_CHECK(mpu6050_i2c_init());
+```
+`ESP_ERROR_CHECK` es una macro que **verifica el código de retorno**: si la función devolvió un error (por
+ejemplo, el sensor no responde por I2C), **detiene el sistema con un "pánico controlado"** y un mensaje claro
+en la consola, **en vez de seguir andando con hardware mal inicializado** (lo que daría fallas raras después).
+Es una decisión de diseño defensiva: en un sistema de tiempo real es mejor **fallar rápido y claro** que
+arrastrar un estado inconsistente.
+
+## VII.6 Detalles del entorno (contexto para el examen)
+
+- **Driver I2C "legacy" vs nuevo.** En ESP-IDF v6 salió un driver I2C nuevo (`esp_driver_i2c`); el que
+  usamos (`driver/i2c.h`, con `i2c_cmd_link`) quedó marcado como *"End Of Life"* pero **sigue funcionando**.
+  Lo usamos porque es el que se ve en clase; la opción `CONFIG_I2C_SUPPRESS_DEPRECATE_WARN=y` solo silencia
+  el aviso de "obsoleto" para que no llene la consola. (Con MCPWM pasó al revés: el *legacy* **sí** se
+  eliminó en v6, por eso servos.c usa la API nueva de handles.)
+- **Huella del firmware.** El programa compilado ocupa **~186 KB**, un **18 %** de los 2 MB de flash del
+  módulo. Queda muchísimo lugar libre: el sistema es chico y eficiente.
+
+## VII.7 Recetario de calibración y ajuste (tuning)  [amplía §IV.4]
+
+Todos los parámetros están en `config.h`. Esta es la guía práctica de "qué tocar según el síntoma"
+(útil si el profesor pregunta "¿cómo lo ajustan si no anda bien?"):
+
+**Centrado de los servos** — si al montarlos no quedan a 0° con el alerón neutro:
+```c
+#define SERVO1_ZERO_US  1500   // probar 1480 o 1520 (rango útil ~1400–1600)
+```
+Subir/bajar el valor corre el servo en un sentido u otro. Es un ajuste físico, no toca la lógica.
+
+**Sentido de un servo** — si un servo corrige *al revés* (agranda la inclinación en vez de reducirla):
+```c
+#define SERVO1_DIR  (-1.0f)   // invertir solo ese servo
+```
+
+**Ganancia del control (`CONTROL_GAIN`)** — cuántos µs corrige por grado de error:
+- Corrige **muy lento** / no se estabiliza a tiempo → **subir** (ej. 15.0), más agresivo.
+- Corrige **muy brusco** / oscila (tiembla) → **bajar** (ej. 5.0), más suave.
+
+**Peso del filtro (`COMP_ALPHA`)** — balance giroscopio/acelerómetro:
+- El ángulo **salta con la vibración** del motor → **subir** hacia 0.995 (más giroscopio, menos ruido).
+- El ángulo **deriva** lentamente con el tiempo (drift visible) → **bajar** hacia 0.95 (más acelerómetro,
+  más "ancla").
+
+> Es un balance: demasiado giroscopio = drift; demasiado acelerómetro = ruido. 0.98 es un buen punto medio.
+
+## VII.8 Detalles de hardware finos
+
+- **Pull-ups del bus I2C.** SDA y SCL necesitan resistencias *pull-up* (el bus es de "colector abierto":
+  los chips solo pueden llevar la línea a 0, y la resistencia la devuelve a 1). Acá se activan los pull-ups
+  **internos** del ESP32 por software. En un diseño definitivo se pondrían resistencias **externas de
+  4.7 kΩ**, pero las internas alcanzan a 400 kHz para el cable corto de la maqueta.
+- **Por qué la dirección del MPU6050 es 0x68.** El chip tiene un pin **AD0** que elige entre dos
+  direcciones: AD0 a **GND → 0x68**; AD0 a 3.3V → 0x69. Como en la maqueta AD0 está a masa, la dirección es
+  **0x68**. (Sirve para poner dos MPU6050 en el mismo bus sin que choquen.)
+
+## VII.9 Práctico: compilar, flashear y ver la consola
+
+Útil para la demo y para responder "¿cómo lo corren?". En cada terminal nueva hay que **activar el entorno**
+ESP-IDF primero:
+```bash
+source ~/esp/esp-idf/export.sh      # agrega idf.py, el compilador y esptool al PATH
+```
+Comandos principales (la placa aparece en Linux como `/dev/ttyUSB0`):
+```bash
+idf.py build                                 # compilar
+idf.py -p /dev/ttyUSB0 flash                 # grabar en la ESP32 (compila si hace falta)
+idf.py -p /dev/ttyUSB0 monitor               # ver la consola serie (salir con Ctrl+])
+idf.py -p /dev/ttyUSB0 flash monitor         # las dos cosas de una
+idf.py -p /dev/ttyUSB0 erase-flash           # borrar toda la flash (resetear estado)
+```
+**Permisos del puerto USB** (si da "permission denied" al flashear): agregar tu usuario al grupo `dialout`
+(`sudo usermod -aG dialout $USER`, y volver a iniciar sesión) o, temporalmente, `sudo chmod 666 /dev/ttyUSB0`.
+
+---
+---
+
+# PARTE VIII — REPASO
+
+## VIII.1 Preguntas probables del profesor (respuestas cortas)
+
+1. **¿Qué es un sistema de tiempo real?** — Uno donde el resultado debe ser correcto **y** llegar dentro de
+   un plazo garantizado; si llega tarde, no sirve. Lo importante es el **determinismo**.
+2. **¿Por qué un RTOS y no un `while(1)` común?** — Para correr varias tareas con **prioridades** y garantías
+   temporales; el RTOS desaloja lo menos importante para atender lo crítico.
+3. **¿Vieron µC/OS? ¿Por qué FreeRTOS?** — En teoría vimos el RTOS con µC/OS-III; usamos FreeRTOS porque
+   viene en el ESP-IDF del ESP32. Mismos conceptos, distinta API.
+4. **¿Por qué el actuador tiene más prioridad que el sensor?** — Porque cierra el lazo de control; apenas hay
+   dato, debe corregir ya, desalojando al sensor.
+5. **¿`vTaskDelay` o `vTaskDelayUntil`? ¿Por qué?** — `vTaskDelayUntil`, para muestreo periódico **exacto**
+   (instantes absolutos), sin acumular deriva.
+6. **¿Este filtro lo vieron en clase?** — En clase vimos media móvil; usamos **filtro complementario**
+   (fusión giroscopio+acelerómetro) porque da un ángulo sin drift y sin retardo (ver II.8).
+7. **¿Por qué la ISR solo levanta una bandera?** — Debe ser cortísima y no bloqueante; el trabajo real lo
+   hace la tarea (trabajo diferido).
+8. **¿Mutex vs spinlock?** — Spinlock para tramos cortísimos que también toca la ISR (no puede dormir);
+   mutex para recursos entre tareas que sí pueden esperar durmiendo.
+9. **¿Qué es I2C y a qué velocidad?** — Bus de 2 cables (SDA datos, SCL reloj), maestro-esclavo,
+   direccionamiento de 7 bits, a 400 kHz. Distinto de los 50 Hz de muestreo, que decidimos nosotros.
+10. **¿Se corrige la gravedad?** — No; se **aprovecha** para calcular la inclinación con el acelerómetro. Lo
+    que se filtra es la vibración (con el giroscopio, vía complementario).
+11. **¿Qué es MCPWM y por qué no LEDC?** — Periférico de PWM para motores; resolución en µs y sin glitches,
+    ideal para servos.
+12. **¿Los servos giran igual o invertido?** — Mecánicamente **opuestos** (para el roll); eléctricamente
+    reciben lo mismo porque el servo 2 está montado espejado.
+13. **¿Qué es el puerto serie / UART?** — Comunicación bit a bit por un cable; UART es el hardware que lo
+    implementa; asíncrono a 115200 baudios; lo vemos con `idf.py monitor`.
+14. **¿Usan procesos o hilos? ¿POSIX?** — Hilos (tareas FreeRTOS), un solo espacio de memoria. No POSIX
+    directo; los conceptos POSIX/µC/OS se mapean a la API de FreeRTOS.
+15. **¿Para qué sirven CMakeLists y sdkconfig.defaults?** — CMakeLists le dice a ESP-IDF qué compilar
+    (obligatorio); sdkconfig.defaults fija opciones como el tick de 1 kHz. El sdkconfig grande es generado.
+
+## VIII.2 Glosario rápido
+
+- **Firmware:** el programa grabado dentro del dispositivo.
+- **Tarea / hilo:** unidad de ejecución que corre "en paralelo" con otras, compartiendo memoria.
+- **Planificador (scheduler):** el árbitro que decide qué tarea corre según prioridad.
+- **Preemption (desalojo):** cuando una tarea de más prioridad interrumpe a una de menos.
+- **ISR:** función que el hardware ejecuta al ocurrir una interrupción; debe ser cortísima.
+- **Mutex:** "llave" para que una sola tarea acceda a un recurso a la vez (los demás duermen esperando).
+- **Spinlock (portMUX):** protección de secciones cortísimas por espera activa; usable desde ISR.
+- **Cola (queue):** buzón FIFO que pasa copias de datos entre tareas de forma segura.
+- **I2C:** bus serie de 2 cables (SDA/SCL) maestro-esclavo con direcciones.
+- **UART / puerto serie:** envío de datos bit a bit; asíncrono; baud rate acordado (115200).
+- **PWM:** señal que "codifica" un valor en el ancho de su pulso; mueve los servos.
+- **MCPWM:** periférico del ESP32 que genera PWM por hardware.
+- **IMU:** sensor inercial (acelerómetro + giroscopio), acá el MPU6050.
+- **Drift:** desvío acumulado del ángulo del giroscopio con el tiempo.
+- **Filtro complementario:** fusión de giroscopio (corto plazo) y acelerómetro (largo plazo).
+- **Punto cero:** la inclinación de referencia que se considera "nivelado".
+- **Baud rate:** bits por segundo del puerto serie.
+- **Determinismo:** poder garantizar que algo ocurre dentro de un plazo conocido, siempre.
+- **ACK / NACK:** bit de confirmación en I2C ("recibido" / "no más datos"); el NACK cierra una lectura.
+- **Repeated start (RESTART):** reiniciar la conversación I2C sin soltar el bus (lectura atómica).
+- **Stack (pila):** memoria privada de cada tarea; medido en *palabras* (1 palabra = 4 bytes en 32 bits).
+- **IRAM:** RAM interna del ESP32; poner código ahí (con `IRAM_ATTR`) evita el retardo de la caché de flash.
+- **Cache miss:** cuando la instrucción no está en la caché y hay que buscarla en flash (retardo impredecible).
+- **Glitch:** pulso deforme (ancho incorrecto); en MCPWM se evita actualizando el comparador al inicio del período.
+- **ESP_ERROR_CHECK:** macro que detiene el sistema con pánico controlado si una inicialización falla.
+- **Baud / baudios:** unidad de velocidad del puerto serie (símbolos por segundo).

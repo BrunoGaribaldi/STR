@@ -2,7 +2,13 @@
  *  main.c
  *  Sistema Controlador de Vuelo en Tiempo Real para Ala Volante (Alerones)
  *
- *  Flujo de arranque:
+ *  MATERIAL DE ESTUDIO: ver RESUMEN_INTEGRAL.md. Las marcas [Guia §X] enlazan
+ *  cada parte del codigo con la seccion que la explica desde cero.
+ *  Este archivo (arranque del sistema) -> [Guia §II.2] y [Guia §IV].
+ *
+ *  app_main() es el "main" de ESP-IDF: FreeRTOS ya esta corriendo cuando se
+ *  ejecuta. Hace los 4 pasos de arranque y termina; el scheduler sigue con las
+ *  tareas creadas. Flujo de arranque:
  *    1. Inicializa el bus I2C y el MPU6050.
  *    2. Inicializa MCPWM y lleva los servos a su pulso neutro (calibracion).
  *    3. Crea cola, mutex e instala la ISR del pulsador.

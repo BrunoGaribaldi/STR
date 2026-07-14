@@ -1,6 +1,9 @@
 /* ============================================================================
  *  mpu6050.c
  *  Driver I2C del MPU6050 usando el driver I2C nativo (legacy) de ESP-IDF.
+ *
+ *  MATERIAL DE ESTUDIO -> [Guia §II.9.a] (protocolo I2C, transaccion paso a
+ *  paso, reconstruccion y escalado) y [Guia §III.2] (el sensor MPU6050).
  * ==========================================================================*/
 
 #include "mpu6050.h"
@@ -33,6 +36,8 @@ static esp_err_t mpu6050_write_reg(uint8_t reg, uint8_t data)
 /* ---------------------------------------------------------------------------
  *  Lee 'len' bytes consecutivos a partir de 'reg' (lectura con repeated-start).
  *  Secuencia: START - addr+W - reg - REPEATED START - addr+R - data... - STOP
+ *  Esta es la transaccion I2C explicada simbolo por simbolo en [Guia §II.9.a].
+ *  El ultimo byte se lee con NACK para decirle al sensor "no quiero mas datos".
  * ------------------------------------------------------------------------- */
 static esp_err_t mpu6050_read_regs(uint8_t reg, uint8_t *buf, size_t len)
 {
@@ -87,7 +92,8 @@ esp_err_t mpu6050_i2c_init(void)
 }
 
 /* ---------------------------------------------------------------------------
- *  Despierta el sensor y fija los rangos de medida.
+ *  Despierta el sensor y fija los rangos de medida.            [Guia §III.2]
+ *  El MPU6050 arranca "dormido"; hay que despertarlo y elegir sus rangos.
  * ------------------------------------------------------------------------- */
 esp_err_t mpu6050_init(void)
 {
@@ -120,7 +126,8 @@ esp_err_t mpu6050_init(void)
 
 /* ---------------------------------------------------------------------------
  *  Lee una muestra completa (14 bytes) y la escala a unidades fisicas.
- *  Layout de los 14 bytes a partir de 0x3B:
+ *  Es el "Paso 3" del recorrido de datos, detallado en [Guia §II.9.a].
+ *  Layout de los 14 bytes a partir de 0x3B (cada medida ocupa 2 bytes):
  *    [0..1] ACC_X  [2..3] ACC_Y  [4..5] ACC_Z
  *    [6..7] TEMP
  *    [8..9] GYRO_X [10..11] GYRO_Y [12..13] GYRO_Z
@@ -133,7 +140,9 @@ esp_err_t mpu6050_read(mpu6050_reading_t *out)
         return ret;
     }
 
-    /* Reconstruir enteros con signo de 16 bits (big-endian: HIGH primero) */
+    /* Reconstruir enteros con signo de 16 bits (big-endian: HIGH primero).
+     * El cast a (int16_t) es CLAVE para interpretar bien los valores negativos
+     * (complemento a dos). Ver explicacion en [Guia §II.9.a "Paso 3"]. */
     int16_t acc_x = (int16_t)((raw[0]  << 8) | raw[1]);
     int16_t acc_y = (int16_t)((raw[2]  << 8) | raw[3]);
     int16_t acc_z = (int16_t)((raw[4]  << 8) | raw[5]);
