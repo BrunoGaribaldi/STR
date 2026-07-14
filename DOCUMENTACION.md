@@ -101,7 +101,7 @@ El MPU6050 es una **IMU** (Inertial Measurement Unit) de 6 ejes fabricada por In
 | ACCEL_CONFIG | 0x1C | Rango del acelerómetro. Valor 0x00 = ±2g. |
 | ACCEL_XOUT_H | 0x3B | Primer byte de los 14 bytes de datos (accel + temp + gyro). |
 
-**Formato de los datos:** El MPU6050 entrega datos en **big-endian**: el byte más significativo llega primero. Cada eje se representa como un entero con signo de 16 bits (int16_t), así que los 14 bytes contienen: ACC_X (2 bytes) + ACC_Y (2 bytes) + ACC_Z (2 bytes) + TEMP (2 bytes, ignorada) + GYRO_X (2 bytes) + GYRO_Y (2 bytes) + GYRO_Z (2 bytes).
+**Formato de los datos:** El MPU6050 entrega datos en **big-endian**: el byte más significativo llega primero. Cada eje se representa como un entero con signo de 16 bits (int16_t), así que los 14 bytes contienen: ACC_X (2 bytes) + ACC_Y (2 bytes) + ACC_Z (2 bytes) + TEMP (2 bytes, ignorada) + GYRO_X (2 bytes) + GYRO_Y (2 bytes) + GYRO_Z (2 bytes). De estos, el firmware solo **guarda y usa** ACC_X/Y/Z, GYRO_X y GYRO_Y; **TEMP y GYRO_Z (guiñada) se leen pero se descartan** porque no intervienen en el control de un eje.
 
 **Factores de escala (del datasheet):**
 - Acelerómetro en rango ±2g: **16384 LSB/g** → dividir el raw por 16384.0 da el valor en *g*.
@@ -126,13 +126,25 @@ El sistema tiene **dos servos**:
 
 En un ala volante, los alerones reciben el nombre de **elevones** porque combinan la función de alerones (control de alabeo) y elevadores (control de cabeceo).
 
-### 3.4 Sensor táctil TTP223
+### 3.4 Pulsador de "punto cero" (entrada de evento)
 
-El TTP223 es un módulo de **detección capacitiva** de un solo toque. Funciona detectando el cambio de capacitancia cuando un dedo se acerca a su superficie metálica, sin necesidad de presión mecánica.
+El sistema usa un **pulsador de un solo toque** para redefinir el punto de equilibrio. En el anteproyecto
+este componente es un sensor táctil capacitivo **TTP223**, pero **el firmware lo trata eléctricamente como
+un contacto momentáneo a GND** (un pulsador clásico), y así debe estar cableado o configurado el módulo.
 
-- **Salida:** digital, 1 bit. En reposo: `LOW` (0). Al tocar: `HIGH` (1). El módulo mantiene la salida en alto mientras se detecta contacto.
-- **Conexión a la ESP32:** La señal de salida se conecta al GPIO 19, configurado con resistencia pull-up interna del ESP32. En reposo (sin tocar), el pull-up mantiene la línea en ALTO (1). Al tocar el sensor, la salida del TTP223 sube a HIGH, pero la ISR detecta el **flanco de bajada** (falling edge): cuando el operador suelta el sensor, la salida del TTP223 vuelve a LOW, y ese flanco descendente es el evento que dispara la ISR.
-- **Función en el sistema:** Al tocarlo con el avión en la posición deseada de equilibrio, el sistema **fija esa inclinación como el nuevo "cero"**, ajustando el punto de referencia de la estabilización sin necesidad de reiniciar.
+- **Comportamiento eléctrico esperado por el código:** entrada digital de 1 bit, **activa en bajo**.
+  En **reposo la línea está en ALTO** (la mantiene el pull-up interno del ESP32); al **accionar**, la
+  entrada se lleva a **GND (BAJO)**.
+- **Conexión a la ESP32:** la señal se conecta al **GPIO 19**, configurado con **resistencia pull-up
+  interna** (`GPIO_PULLUP_ENABLE`). La interrupción se arma en **flanco de bajada** (`GPIO_INTR_NEGEDGE`):
+  el evento que dispara la ISR es la transición **ALTO→BAJO** al accionar el pulsador.
+- **Nota sobre el TTP223:** un TTP223 en configuración de fábrica es *activo en alto* (reposo BAJO, toque
+  ALTO). Para funcionar con este firmware (activo en bajo, flanco de bajada) el módulo debe estar
+  jumpereado/cableado en consecuencia, o bien usarse directamente un pulsador mecánico a GND. Conviene
+  verificarlo contra el hardware real de la maqueta.
+- **Función en el sistema:** al accionarlo con el avión en la posición deseada de equilibrio, el sistema
+  **fija esa inclinación como el nuevo "cero"**, ajustando el punto de referencia de la estabilización
+  sin necesidad de reiniciar.
 
 ---
 
@@ -173,7 +185,7 @@ FreeRTOS corre en este proyecto con un tick de **1000 Hz** (1 ms por tick), lo q
 | 3.3V | 3V3 | MPU6050 | VCC | Alimentación del sensor |
 | 5V | VIN/5V | SG90 x2, TTP223 | VCC | Alimentación servos y táctil |
 
-**Nota sobre el pull-up del pulsador:** GPIO 19 tiene activada la resistencia pull-up interna del ESP32 (`GPIO_PULLUP_ENABLE`). Esto significa que la línea está en ALTO cuando el sensor no se toca. La interrupción se configura en flanco de bajada (falling edge), que ocurre cuando el TTP223 cae de ALTO a BAJO al soltarlo.
+**Nota sobre el pull-up del pulsador:** GPIO 19 tiene activada la resistencia pull-up interna del ESP32 (`GPIO_PULLUP_ENABLE`). Esto significa que la línea está en ALTO en reposo (sin accionar). La interrupción se configura en flanco de bajada (falling edge), que ocurre en la transición de ALTO a BAJO al **accionar** el pulsador (contacto a GND). Ver la sección 3.4 sobre la naturaleza del pulsador.
 
 **Nota sobre el bus I2C:** Las líneas SDA y SCL también tienen pull-up activado desde el software (`sda_pullup_en = GPIO_PULLUP_ENABLE`, `scl_pullup_en = GPIO_PULLUP_ENABLE`). En un diseño final se usarían resistencias pull-up externas de 4.7 kΩ, pero las internas del ESP32 son suficientes a 400 kHz para la longitud de cable de esta maqueta.
 
@@ -229,12 +241,11 @@ Registra el **componente principal** de ESP-IDF. `idf_component_register` es la 
 
 Centraliza **todos** los parámetros del sistema en un único lugar. Si se necesita ajustar cualquier constante (pines, ganancias, frecuencias, prioridades), este es el único archivo a modificar.
 
-**Sección: selección de eje de control**
-```c
-#define CONTROL_AXIS_ROLL   1   // Controlar alabeo (roll)
-// #define CONTROL_AXIS_PITCH 1 // Controlar cabeceo (pitch)
-```
-Solo una de las dos puede estar activa. Determina qué eje corrigen los servos. El otro eje se mide y reporta pero no genera corrección mecánica. Se usa un `#if defined(...)` en `tasks.c` para seleccionar la rama de control en tiempo de compilación.
+**Sección: eje de control**
+
+El sistema controla **un solo eje: el ROLL (alabeo)**, que es el eje natural de los alerones en un ala
+volante. El **PITCH (cabeceo) se mide y se reporta** por consola, pero **no genera corrección mecánica**.
+Esta elección es fija en el firmware (el actuador aplica la corrección de roll directamente).
 
 **Sección: pines de hardware**
 ```c
@@ -296,13 +307,7 @@ La cola tiene capacidad para 5 muestras. En condiciones normales, el actuador co
 
 ### `main.c`
 
-Contiene la función `app_main()`, que es el equivalente al `main()` de C estándar en ESP-IDF. FreeRTOS ya está corriendo cuando `app_main` se ejecuta (es en sí misma una tarea de FreeRTOS de alta prioridad).
-
-También contiene dos modos de prueba compilados condicionalmente:
-- `BUTTON_TEST_MODE`: configura GPIO 19 como entrada y reporta por serie cada cambio de nivel. Sirve para verificar que el TTP223 está bien cableado.
-- `SERVO_TEST_MODE`: barre ambos servos de 1000 a 2000 µs continuamente, sin MPU ni control. Sirve para comparar la velocidad mecánica de ambos servos y verificar que reciben la señal correctamente.
-
-Estos modos se activan pasando un flag al compilador: `idf.py build -DSERVO_TEST_MODE=1`.
+Contiene la función `app_main()`, que es el equivalente al `main()` de C estándar en ESP-IDF. FreeRTOS ya está corriendo cuando `app_main` se ejecuta (es en sí misma una tarea de FreeRTOS de alta prioridad). Su cuerpo son los 5 pasos de arranque (ver sección 7) y nada más: es un archivo corto de ~40 líneas.
 
 ---
 
@@ -611,8 +616,8 @@ Este es un controlador **P puro** (proporcional sin integral ni derivativo). Es 
 **Para corregir alabeo (roll):**  
 Ambos servos se mueven en sentido opuesto entre sí para generar un momento de alabeo. Como en este montaje físico particular ambos servos están invertidos especularmente, `SERVO1_DIR` y `SERVO2_DIR` son ambos `+1.0`, y la ecuación hace que ambos se muevan en el mismo sentido eléctrico pero en sentido mecánico opuesto (porque uno está montado al revés).
 
-**Para corregir cabeceo (pitch):**  
-Ambos servos se moverían en el mismo sentido para inclinar toda la superficie alar, generando un momento de cabeceo.
+**Para corregir cabeceo (pitch) — no implementado, solo conceptual:**  
+Ambos servos se moverían en el mismo sentido para inclinar toda la superficie alar, generando un momento de cabeceo. El firmware **no** corrige pitch (solo lo mide y lo reporta); esto se documenta a título ilustrativo de cómo sería el control del otro eje en un ala volante.
 
 ### Saturación (clamping)
 
@@ -761,10 +766,6 @@ idf.py -p /dev/ttyUSB0 flash monitor
 
 # Borrar toda la flash del chip (útil para resetear estado)
 idf.py -p /dev/ttyUSB0 erase-flash
-
-# Modos de prueba (recompila con el flag activo)
-idf.py build -DSERVO_TEST_MODE=1
-idf.py build -DBUTTON_TEST_MODE=1
 ```
 
 ---
@@ -822,14 +823,6 @@ Si la corrección es muy brusca o genera oscilaciones:
 #define CONTROL_GAIN  5.0f    // más suave
 ```
 
-### Eje de control
-
-Cambiar de alabeo a cabeceo:
-```c
-// #define CONTROL_AXIS_ROLL   1   // comentar esta línea
-#define CONTROL_AXIS_PITCH  1      // descomentar esta
-```
-
 ### Peso del filtro complementario
 
 Si el sistema es muy sensible a vibraciones (el ángulo salta bajo vibración del motor), reducir el peso del acelerómetro:
@@ -859,7 +852,7 @@ Si el ángulo deriva lentamente con el tiempo (drift del giroscopio visible), au
                     │  14 bytes: acc_xyz (int16) + gyro_xyz    │
                     │  Escala: /16384 → g,  /131 → °/s        │
                     └──────────────┬───────────────────────────┘
-                                   │ mpu6050_reading_t (6 floats)
+                                   │ mpu6050_reading_t (5 floats: acc_xyz, gyro_x, gyro_y)
                                    ▼
                     ┌──────────────────────────────────────────┐
                     │  task_sensor (prio 5, 50 Hz exactos)     │

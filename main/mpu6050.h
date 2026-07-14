@@ -13,6 +13,8 @@
 /* Estructura con una lectura cruda escalada del MPU6050.
  *   acc_*  en g  (gravedades)
  *   gyro_* en grados/segundo
+ * Nota: solo se usan gyro_x (roll) y gyro_y (pitch); el eje Z del giroscopio
+ * (guinada) no interviene en este proyecto, por eso no se guarda.
  */
 typedef struct {
     float acc_x;
@@ -20,7 +22,6 @@ typedef struct {
     float acc_z;
     float gyro_x;
     float gyro_y;
-    float gyro_z;
 } mpu6050_reading_t;
 
 /* Inicializa el driver I2C maestro (pines y velocidad de config.h). */

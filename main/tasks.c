@@ -60,7 +60,7 @@ static const char *TAG_MON    = "MONITOR";
 static const char *TAG_ISR    = "ISR";
 
 /* ===========================================================================
- *  ISR DEL PULSADOR (GPIO19, flanco positivo)
+ *  ISR DEL PULSADOR (GPIO19, flanco de BAJADA - ver GPIO_INTR_NEGEDGE abajo)
  *  Antirrebote por software de 300 ms. Solo levanta una bandera; el trabajo
  *  real (fijar el cero) lo hace la tarea sensor, que es quien conoce el angulo.
  * ==========================================================================*/
@@ -160,44 +160,27 @@ static void task_actuator(void *arg)
         if (xQueueReceive(imu_queue, &data,
                           pdMS_TO_TICKS(ACTUATOR_QUEUE_TIMEOUT_MS)) == pdTRUE) {
 
-            /* Leer el punto cero de forma segura (mutex) */
-            float z_roll, z_pitch;
+            /* Leer el punto cero de ROLL de forma segura (mutex) */
+            float z_roll;
             if (xSemaphoreTake(zero_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                z_roll  = zero_roll;
-                z_pitch = zero_pitch;
+                z_roll = zero_roll;
                 xSemaphoreGive(zero_mutex);
             } else {
                 /* Si no se pudo, usar 0 como referencia segura este ciclo */
                 z_roll = 0.0f;
-                z_pitch = 0.0f;
                 ESP_LOGW(TAG_ACT, "Timeout tomando zero_mutex");
             }
 
-            /* Error respecto al punto cero */
-            float error_roll  = data.roll  - z_roll;
-            float error_pitch = data.pitch - z_pitch;
+            /* Error de ALABEO respecto al punto cero.
+             * (El pitch se mide y se reporta, pero no genera correccion.) */
+            float error_roll = data.roll - z_roll;
 
-            /* Partimos del neutro fisico de cada servo */
-            float s1 = (float)SERVO1_ZERO_US;
-            float s2 = (float)SERVO2_ZERO_US;
-
-#if defined(CONTROL_AXIS_ROLL)
-            /* --- UN SOLO EJE: ALABEO (ROLL) ---
-             * Cada servo aplica la correccion segun su sentido fisico
+            /* Partimos del neutro fisico de cada servo y aplicamos la
+             * correccion de roll segun el sentido de cada servo
              * (SERVO1_DIR / SERVO2_DIR en config.h). En este montaje ambos
              * van con el mismo signo (Servo2 estaba invertido). */
-            s1 += SERVO1_DIR * error_roll * CONTROL_GAIN;
-            s2 += SERVO2_DIR * error_roll * CONTROL_GAIN;
-            (void)error_pitch; /* pitch solo se monitorea, no corrige */
-#elif defined(CONTROL_AXIS_PITCH)
-            /* --- UN SOLO EJE: CABECEO (PITCH) ---
-             * Cada servo aplica la correccion segun su sentido fisico. */
-            s1 += SERVO1_DIR * error_pitch * CONTROL_GAIN;
-            s2 += SERVO2_DIR * error_pitch * CONTROL_GAIN;
-            (void)error_roll;  /* roll solo se monitorea, no corrige */
-#else
-    #error "Definir CONTROL_AXIS_ROLL o CONTROL_AXIS_PITCH en config.h"
-#endif
+            float s1 = (float)SERVO1_ZERO_US + SERVO1_DIR * error_roll * CONTROL_GAIN;
+            float s2 = (float)SERVO2_ZERO_US + SERVO2_DIR * error_roll * CONTROL_GAIN;
 
             /* Limitar al rango seguro [1000, 2000] us */
             if (s1 < SERVO_MIN_US) s1 = SERVO_MIN_US;

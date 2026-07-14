@@ -18,21 +18,13 @@
  *      - Subir/bajar CONTROL_GAIN.
  *
  *  EJE DE TRABAJO DEL MPU:
- *      Por requerimiento, el sistema controla UN SOLO EJE.
- *      Por defecto se controla el ROLL (alabeo), que es el eje natural
- *      de los alerones en un ala volante. Para cambiar a PITCH (cabeceo)
- *      basta con definir CONTROL_AXIS_PITCH (ver mas abajo).
+ *      Por requerimiento, el sistema controla UN SOLO EJE: el ROLL (alabeo),
+ *      que es el eje natural de los alerones en un ala volante. El PITCH
+ *      (cabeceo) se mide y se reporta por consola, pero no genera correccion.
  * ==========================================================================*/
 
 #ifndef CONFIG_H
 #define CONFIG_H
-
-/* ---------------------------------------------------------------------------
- *  SELECCION DE EJE DE CONTROL (UN SOLO EJE)
- *  Descomentar UNA de las dos lineas. Por defecto: ROLL.
- * ------------------------------------------------------------------------- */
-#define CONTROL_AXIS_ROLL      1   /* Controlar ALABEO (recomendado ala volante) */
-/* #define CONTROL_AXIS_PITCH  1 */ /* Controlar CABECEO */
 
 /* ===========================================================================
  *  PINES DE HARDWARE

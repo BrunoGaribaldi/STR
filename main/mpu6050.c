@@ -137,17 +137,15 @@ esp_err_t mpu6050_read(mpu6050_reading_t *out)
     int16_t acc_x = (int16_t)((raw[0]  << 8) | raw[1]);
     int16_t acc_y = (int16_t)((raw[2]  << 8) | raw[3]);
     int16_t acc_z = (int16_t)((raw[4]  << 8) | raw[5]);
-    /* raw[6..7] es temperatura: se ignora */
+    /* raw[6..7] es temperatura y raw[12..13] es GYRO_Z: no se usan, se ignoran */
     int16_t gyr_x = (int16_t)((raw[8]  << 8) | raw[9]);
     int16_t gyr_y = (int16_t)((raw[10] << 8) | raw[11]);
-    int16_t gyr_z = (int16_t)((raw[12] << 8) | raw[13]);
 
     out->acc_x  = acc_x / ACCEL_SCALE_2G;
     out->acc_y  = acc_y / ACCEL_SCALE_2G;
     out->acc_z  = acc_z / ACCEL_SCALE_2G;
     out->gyro_x = gyr_x / GYRO_SCALE_250DPS;
     out->gyro_y = gyr_y / GYRO_SCALE_250DPS;
-    out->gyro_z = gyr_z / GYRO_SCALE_250DPS;
 
     return ESP_OK;
 }

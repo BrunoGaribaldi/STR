@@ -1,0 +1,8 @@
+# Material de la cátedra (clases, diapositivas y laboratorios): no se versiona
+Clases/
+
+# Artefactos generados por ESP-IDF (se regeneran al compilar; no se versionan).
+# Se versiona sdkconfig.defaults (fuente); sdkconfig se genera a partir de él.
+/build/
+sdkconfig
+sdkconfig.old
