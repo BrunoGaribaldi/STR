@@ -112,7 +112,11 @@
  * ==========================================================================*/
 #define IMU_QUEUE_LENGTH       5      /* Capacidad de la cola de angulos   */
 
-#define MONITOR_PERIOD_MS      200    /* Periodo de impresion del monitor  */
+/* Telemetria $ATT a 50 Hz (mismo ritmo que el sensor) para que el attitude
+ * indicator de la PC se mueva fluido. Los logs humanos NO hacen falta tan
+ * seguido: se emiten cada N tramas (decimacion) para no saturar el UART. */
+#define TELEMETRY_PERIOD_MS    20     /* Trama $ATT cada 20 ms (50 Hz)     */
+#define MONITOR_LOG_DECIMATION 10     /* Logs humanos cada 10 tramas=200ms */
 #define ACTUATOR_QUEUE_TIMEOUT_MS 100 /* Timeout de espera en la cola      */
 
 /* Prioridades (mayor numero = mayor prioridad).  [Guia §II.4]

@@ -13,7 +13,7 @@
  *  Arquitectura:
  *    task_sensor   (prio MEDIA) -> lee MPU6050 @50Hz, filtra, publica en cola.
  *    task_actuator (prio ALTA)  -> consume cola, calcula correccion, mueve servos.
- *    task_monitor  (prio BAJA)  -> imprime estado por puerto serie cada 200ms.
+ *    task_monitor  (prio BAJA)  -> telemetria $ATT @50Hz + logs cada 200ms.
  *    gpio_isr_handler (ISR)     -> al pulsar, solicita fijar nuevo punto cero.
  *
  *  CONTROL DE UN SOLO EJE: el actuador corrige ROLL (alabeo). El PITCH se mide
@@ -32,6 +32,7 @@
 
 #include <math.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 #define RAD_TO_DEG (57.2957795f)   /* 180/PI */
 
@@ -238,16 +239,24 @@ static void task_actuator(void *arg)
 }
 
 /* ===========================================================================
- *  TAREA DE MONITOREO (prio BAJA=3).                          [Guia §II.9.b]
- *  Imprime el estado por el PUERTO SERIE (UART) cada 200 ms con ESP_LOGI.
- *  Cada 200 ms (no mas seguido) porque es comodo de leer y no debe molestar al
- *  control; por ser la de menor prioridad, corre solo en los ratos libres.
+ *  TAREA DE MONITOREO Y TELEMETRIA (prio BAJA=3).             [Guia §II.9.b]
+ *  Emite DOS salidas por el UART, a ritmos distintos (DECIMACION):
+ *    1. Cada TELEMETRY_PERIOD_MS (20 ms = 50 Hz, el mismo ritmo del sensor):
+ *       la trama "$ATT,..." (printf, CSV estilo NMEA) para que el attitude
+ *       indicator de la PC se mueva fluido, sin muestras "viejas".
+ *    2. Cada MONITOR_LOG_DECIMATION tramas (10 -> 200 ms): los logs humanos
+ *       (ESP_LOGI). Un humano no lee mas de ~5 lineas por segundo, y asi el
+ *       UART queda holgado (~20% de 115200 baudios).
+ *  Por ser la tarea de menor prioridad, corre solo en los ratos libres y
+ *  nunca molesta al lazo de control.
  * ==========================================================================*/
 static void task_monitor(void *arg)
 {
     TickType_t last_wake = xTaskGetTickCount();
+    uint32_t   cycle     = 0;   /* contador para la decimacion de los logs */
 
-    ESP_LOGI(TAG_MON, "Tarea monitor iniciada (cada %d ms)", MONITOR_PERIOD_MS);
+    ESP_LOGI(TAG_MON, "Tarea monitor iniciada ($ATT cada %d ms, logs cada %d ms)",
+             TELEMETRY_PERIOD_MS, TELEMETRY_PERIOD_MS * MONITOR_LOG_DECIMATION);
 
     for (;;) {
         /* Leer ultimos angulos de forma atomica */
@@ -265,14 +274,25 @@ static void task_monitor(void *arg)
             xSemaphoreGive(zero_mutex);
         }
 
-        ESP_LOGI(TAG_MON,
-                 "[VUELO] Roll: %+.1f° | Pitch: %+.1f° | Zero(R/P): %.1f°/%.1f°",
-                 roll, pitch, z_roll, z_pitch);
-        ESP_LOGI(TAG_MON,
-                 "        Servo1: %uus | Servo2: %uus",
-                 (unsigned)last_servo1_us, (unsigned)last_servo2_us);
+        /* [Guia §II.9.b] TELEMETRIA para programas externos. Una trama por
+         * linea, CSV con prefijo (estilo NMEA de los GPS):
+         *   $ATT,<roll>,<pitch>,<zero_roll>,<zero_pitch>
+         * Va con printf directo (sin prefijo de log ni simbolos °) para que
+         * la maquina la parsee: filtrar por "$ATT" y hacer split por comas. */
+        printf("$ATT,%.2f,%.2f,%.2f,%.2f\n", roll, pitch, z_roll, z_pitch);
 
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(MONITOR_PERIOD_MS));
+        /* Logs humanos DECIMADOS: 1 de cada MONITOR_LOG_DECIMATION ciclos */
+        if (++cycle >= MONITOR_LOG_DECIMATION) {
+            cycle = 0;
+            ESP_LOGI(TAG_MON,
+                     "[VUELO] Roll: %+.1f° | Pitch: %+.1f° | Zero(R/P): %.1f°/%.1f°",
+                     roll, pitch, z_roll, z_pitch);
+            ESP_LOGI(TAG_MON,
+                     "        Servo1: %uus | Servo2: %uus",
+                     (unsigned)last_servo1_us, (unsigned)last_servo2_us);
+        }
+
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(TELEMETRY_PERIOD_MS));
     }
 }
 

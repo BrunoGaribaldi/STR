@@ -6,3 +6,7 @@ Clases/
 /build/
 sdkconfig
 sdkconfig.old
+
+# Visualizador Python (AirTelemetry): entorno y caches locales
+AirTelemetry/venv/
+__pycache__/

@@ -38,6 +38,7 @@
 > | `servos.c/.h` | PWM / MCPWM | §II.9.c |
 > | `tasks.c` (clave) | Tareas, ISR, sincronización, filtro, control | §II.4–II.8, §IV.3, §V |
 > | `tasks.h` | Struct de la cola | §II.6.c |
+> | `AirTelemetry/` (PC) | Visualizador: attitude indicator + telemetría | §IV.5, §II.9.b |
 
 ---
 ---
@@ -88,7 +89,8 @@ esto para siempre. Nuestro sistema hace lo mismo pero con **ángulo de inclinaci
 - **MPU6050:** el sensor que dice cómo está inclinado el avión.
 - **Servos SG90:** dos motorcitos que mueven los alerones.
 - **Botón:** para fijar cuál es la posición "nivelada" de referencia.
-- **Puerto serie:** cable por el que el ESP32 le "cuenta" a la PC qué está pasando.
+- **Puerto serie:** cable por el que el ESP32 le "cuenta" a la PC qué está pasando: se lee en la consola
+  y alimenta el **horizonte artificial** (visualizador `AirTelemetry/`, ver §IV.5).
 
 Todo el resto del documento explica **cada una de estas piezas y cómo se hablan entre sí**.
 
@@ -174,7 +176,7 @@ el control y ejecuta tus tareas. O sea: no es del chip, es del SDK, y termina ad
 
 ### El problema que resuelve un sistema operativo
 Nuestro programa tiene que hacer **varias cosas a la vez**: leer el sensor cada 20 ms, mover servos,
-imprimir por consola cada 200 ms, atender el botón. Si lo escribiéramos como un único `while(true)`
+emitir telemetría 50 veces por segundo, atender el botón. Si lo escribiéramos como un único `while(true)`
 gigante haciendo todo en orden, sería un lío frágil y difícil de temporizar.
 
 Un **sistema operativo (SO)** resuelve esto dejándote escribir cada actividad por separado (una **tarea**)
@@ -224,7 +226,7 @@ sincronizar, más abajo).
 En nuestro proyecto hay **tres tareas**:
 - `task_sensor`: lee el sensor y filtra, 50 veces por segundo.
 - `task_actuator`: recibe el ángulo y mueve los servos.
-- `task_monitor`: imprime por consola cada 200 ms.
+- `task_monitor`: emite la telemetría a 50 Hz y los logs de estado cada 200 ms.
 
 ### ¿Qué es el planificador (scheduler) y la "prioridad"?
 Como el ESP32 tiene pocos núcleos y varias tareas, alguien tiene que decidir **cuál corre en cada momento**.
@@ -614,22 +616,76 @@ dos lados no coinciden en esa velocidad, se ve basura.
 "ve" un puerto serie (en Linux aparece como `/dev/ttyUSB0`). Con el comando `idf.py monitor` abrís ese
 puerto y ves en la terminal lo que el ESP32 escribe.
 
-**¿Cómo lo manejamos en el código?** No manejamos el UART "a mano": usamos la función de log del ESP-IDF
-**`ESP_LOGI(...)`** (I = Info). Esa función formatea el texto y lo manda al UART0 (que es el puerto serie
-de consola). Ejemplo de lo que imprime la tarea monitor:
-```
-I (1234) MONITOR: [VUELO] Roll: +3.4° | Pitch: -1.2° | Zero(R/P): 0.0°/0.0°
-```
-(La `I` = Info, `1234` = milisegundos desde el arranque, `MONITOR` = la etiqueta de la tarea.)
+**¿Cómo lo manejamos en el código?** No manejamos el UART "a mano". La tarea monitor emite **dos tipos de
+salida** por el mismo puerto serie, **a ritmos distintos**:
 
-> **¿Por qué imprime cada 200 ms y no más seguido?** Por tres razones:
-> 1. **Para vos (humano):** 5 líneas por segundo ya es cómodo de leer. A 50 Hz (cada 20 ms) sería una
->    catarata ilegible de texto.
-> 2. **Para no saturar:** imprimir mucho gasta CPU y llena el cable serie con datos que nadie necesita tan
->    seguido.
-> 3. **Para no molestar al control:** la tarea monitor tiene la **prioridad más baja (3)**. Corre en los
->    ratos libres. Aunque imprimir tarde, **nunca** le quita tiempo al sensor ni al actuador. Imprimir es lo
->    menos urgente del sistema.
+1. **Una trama de telemetría para máquinas** cada 20 ms (50 Hz), con `printf` directo (explicada en el
+   bloque siguiente).
+2. **Logs para humanos** cada 200 ms, con la función de log del ESP-IDF **`ESP_LOGI(...)`** (I = Info):
+   formatea el texto y lo manda al UART0 (el puerto serie de consola).
+
+Ejemplo de lo que se ve en la consola (el ciclo en que coinciden ambas salidas):
+```
+$ATT,3.40,-1.20,0.00,0.00
+I (1234) MONITOR: [VUELO] Roll: +3.4° | Pitch: -1.2° | Zero(R/P): 0.0°/0.0°
+I (1234) MONITOR:         Servo1: 1534us | Servo2: 1534us
+```
+(En la línea de log: la `I` = Info, `1234` = milisegundos desde el arranque, `MONITOR` = la etiqueta de la
+tarea. La primera línea es la telemetría.)
+
+#### La trama de telemetría `$ATT` (para el horizonte artificial)
+
+**¿Qué es "telemetría"?** Medir en un lugar y **transmitir** los datos para que otro sistema los use a
+distancia (tele = lejos, metría = medir). Acá: el ESP32 mide la inclinación y se la transmite a la PC.
+
+**¿Para qué la agregamos?** Para alimentar un programa externo que dibuja un **attitude indicator**
+(horizonte artificial: el instrumento de los aviones que muestra la inclinación respecto del horizonte).
+Ese programa necesita tres cosas: el **roll**, el **pitch** y el **punto cero** (el horizonte de
+referencia que fijás con el botón, ver §II.5). Los logs `ESP_LOGI` ya contienen esos números, pero en un
+formato pensado para ojos humanos: tienen prefijo variable (`I (1234) MONITOR:`), símbolos `°` (que en
+UTF-8 ocupan varios bytes) y los datos repartidos en dos líneas. Parsear eso con un programa es **frágil**:
+cualquier retoque estético del texto lo rompe. La solución clásica es separar aguas: una línea **para
+máquinas**, estable y mínima, conviviendo con los logs **para humanos**.
+
+**El formato, campo por campo:**
+```
+$ATT,<roll>,<pitch>,<zero_roll>,<zero_pitch>
+  │     │      │        │           └─ pitch del punto cero (grados)
+  │     │      │        └─ roll del punto cero / horizonte (grados)
+  │     │      └─ pitch actual filtrado (grados)
+  │     └─ roll actual filtrado (grados)
+  └─ prefijo fijo: identifica la trama ("ATTitude") entre los logs mezclados
+```
+Una **línea = una trama** completa, valores con 2 decimales separados por comas (CSV). El diseño está
+inspirado en **NMEA**, el formato de los GPS (`$GPGGA,...`): prefijo `$` + tipo de trama + campos CSV.
+Es un estándar probado hace 40 años justamente para este problema: mandar mediciones por un puerto serie
+de forma que cualquier programa las parsee fácil.
+
+**¿Por qué `printf` y no `ESP_LOGI`?** Porque `ESP_LOGI` le agrega el prefijo de log (nivel, timestamp,
+tag) y colores opcionales: ruido para un parser. `printf` escribe la línea **tal cual** al mismo UART0.
+Como cada `printf` es una única llamada, la línea sale entera (no se entremezcla con los logs de otras
+tareas a mitad de línea).
+
+**¿Cómo se parsea del otro lado?** Filtrando por el prefijo y separando por comas. En Python:
+```python
+line = puerto_serie.readline().decode(errors="ignore").strip()
+if line.startswith("$ATT,"):
+    roll, pitch, zero_roll, zero_pitch = map(float, line[5:].split(","))
+```
+Todo lo que no empiece con `$ATT,` (logs de arranque, warnings, etc.) simplemente se ignora.
+
+> **¿A qué ritmo emite y por qué? (la DECIMACIÓN)** El período original del monitor era 200 ms (5 líneas
+> por segundo), elegido para lectura humana. Al sumar el attitude indicator, la telemetría pasó a **20 ms
+> (50 Hz, el mismo ritmo del sensor)**: así el visualizador recibe **cada** muestra nueva y el movimiento
+> se ve fluido, sin retardo por muestras "viejas". Pero los logs humanos a 50 Hz serían una catarata
+> ilegible, así que se **deciman**: se emite 1 log cada 10 tramas (`MONITOR_LOG_DECIMATION`), o sea cada
+> 200 ms, como al principio. *Decimar* = quedarse con 1 de cada N muestras: es la forma estándar de tener
+> dos consumidores del mismo dato a ritmos distintos.
+>
+> **¿El UART aguanta 50 Hz?** A 115200 baudios mueve ~11,5 KB/s. La trama `$ATT` (~31 bytes) a 50 Hz son
+> ~1,6 KB/s, más los 2 logs (~150 bytes) a 5 Hz son ~0,75 KB/s: total ~2,3 KB/s ≈ **20% del enlace** —
+> holgado. Y el tiempo real no se compromete: la tarea monitor tiene la **prioridad más baja (3)**, corre
+> en los ratos libres y **nunca** le quita tiempo al sensor ni al actuador.
 
 *(Actuadores/señales de control y noción de comunicación: diapo `02-señales`. Puerto serie: se usa en todos
 los labs de ESP32 para ver la salida.)*
@@ -767,6 +823,10 @@ estudiar**: cada archivo es **un solo tema**.
 
 **Si tenés poquísimo tiempo:** `config.h` + `tasks.c`. Con esos dos entendés el 80%.
 
+> Además del firmware, el proyecto incluye el **visualizador** `AirTelemetry/` (Python, corre en la PC):
+> dibuja el horizonte artificial con la telemetría `$ATT`. No es parte del sistema de tiempo real; está
+> explicado en **§IV.5**.
+
 **Dentro de `tasks.c`, leé en este orden:** (1) las variables globales de sincronización, (2) `gpio_isr_handler`
 (la ISR), (3) `task_sensor`, (4) `task_actuator`, (5) `task_monitor`, (6) `tasks_sync_init`/`tasks_start`.
 
@@ -780,7 +840,7 @@ estudiar**: cada archivo es **un solo tema**.
 |---|:---:|---|---|
 | `task_sensor` | 5 | cada 20 ms (`vTaskDelayUntil`) | Lee MPU → calcula ángulos → **filtro complementario** → atiende el botón → publica en la cola |
 | `task_actuator` | 7 | cuando llega dato a la cola | Recibe ángulo → calcula error vs punto cero → **control P** → mueve servos |
-| `task_monitor` | 3 | cada 200 ms | Imprime estado por puerto serie |
+| `task_monitor` | 3 | cada 20 ms | Emite telemetría `$ATT` a 50 Hz + logs de estado decimados (cada 200 ms) |
 | ISR del botón | HW (máx) | al accionar GPIO19 | Levanta la bandera "recalibrar punto cero" (nada más) |
 
 ## IV.3 El control proporcional (P)
@@ -810,8 +870,81 @@ Todo se ajusta desde un solo archivo. Los más importantes:
 | `SERVOx_ZERO_US` | 1500 | Centro de cada servo (calibración física) |
 | `SERVOx_DIR` | +1.0 | Sentido de cada servo (invertir con −1.0) |
 | `PRIO_*` | 5/7/3 | Prioridades de las tareas |
+| `TELEMETRY_PERIOD_MS` | 20 | Período de la trama `$ATT` (50 Hz) |
+| `MONITOR_LOG_DECIMATION` | 10 | Logs humanos cada N tramas (10 → 200 ms) |
 | `BUTTON_DEBOUNCE_US` | 300000 | Antirrebote del botón (300 ms) |
 | `I2C_MASTER_FREQ_HZ` | 400000 | Velocidad del bus I2C |
+
+## IV.5 El visualizador en la PC: `AirTelemetry/` (horizonte artificial)
+
+Del lado de la PC hay un segundo programa, en **Python**, que consume la telemetría `$ATT` (§II.9.b) y
+dibuja un **attitude indicator** (horizonte artificial): el instrumento de avión que muestra la actitud
+respecto del horizonte. Vive en la carpeta `AirTelemetry/` del proyecto.
+
+> **Aclaración importante para el examen:** el visualizador **NO es parte del sistema de tiempo real**.
+> Corre en la PC, sobre un SO de escritorio, **sin garantías temporales** — y no hace falta que las tenga:
+> el lazo de control cierra completo dentro del ESP32. Si la PC se cuelga o se desconecta el cable, el
+> avión **sigue estabilizándose igual**. El visualizador solo *observa*.
+
+**De dónde sale:** es un recorte del proyecto open-source *AirTelemetry* (instrumentos de vuelo en
+tkinter). Traía cuatro instrumentos, demos y un entorno de otra máquina; se eliminó todo lo que no fuera
+el attitude indicator (política de **mínimo código**: solo lo funcional que se usa). Quedaron 2 archivos
+de código y 2 imágenes:
+
+| Archivo | Qué hace |
+|---|---|
+| `attitude.py` | La **clase del instrumento** (`AttitudeIndicator`, un canvas de tkinter). Solo dibuja. |
+| `uart_attitude.py` | El **programa principal**: hilo lector del puerto serie + bucle de la GUI. |
+| `assets/attitudebg1.png` | Fondo cielo/tierra que rota y se desplaza. |
+| `assets/attitudefg.png` | Frente fijo: bisel del instrumento + el "avioncito" central. |
+
+**Cómo dibuja la actitud (`attitude.py`):** el instrumento real funciona "al revés de la intuición": el
+avioncito queda **fijo** y lo que se mueve es el **fondo** (cielo arriba, tierra abajo). El fondo **rota**
+con el roll y se **desplaza** con el pitch (90° de pitch = 262 píxeles). Rotar imágenes es caro, así que
+se cachean las rotaciones en pasos de 0.25°.
+
+**La línea amarilla del punto cero:** es la novedad agregada para este proyecto. Dibuja el **horizonte de
+referencia**: la actitud que el controlador considera "nivelado" (la que fijaste con el botón, §II.5). Se
+dibuja igual que el horizonte del fondo pero usando el **error** (actitud actual menos punto cero):
+
+- Si el avión está **clavado en la referencia** (error 0), la línea queda **horizontal y centrada** sobre
+  el avioncito.
+- Con punto cero `0/0`, la línea **coincide exactamente** con el horizonte real del fondo.
+- Al tocar el botón, el nuevo cero llega por la trama `$ATT` y la línea **salta al centro**: es la
+  confirmación visual de la recalibración.
+
+**Productor-consumidor... ¡otra vez!** La arquitectura interna de `uart_attitude.py` es el **mismo patrón**
+que usamos dentro del ESP32 (§II.6.c), ahora con la API de Python:
+
+| Rol | En el ESP32 (FreeRTOS) | En la PC (Python) |
+|---|---|---|
+| Productor | `task_sensor` lee el MPU por I2C | Hilo `uart_reader` lee el puerto serie |
+| Canal seguro | `xQueueSend` / `xQueueReceive` | `queue.Queue` (`put` / `get`) |
+| Consumidor | `task_actuator` mueve servos | Bucle de la GUI redibuja el instrumento |
+
+¿Por qué hace falta el hilo? Porque leer el puerto serie **bloquea** esperando datos, y la GUI de tkinter
+necesita su bucle corriendo siempre (además tkinter **no es thread-safe**: solo el hilo de la GUI puede
+dibujar). El hilo lector encola; la GUI desencola cada ~16 ms (60 fps).
+
+**El suavizado exponencial (`ALPHA = 0.6`):** las tramas llegan a 50 Hz y la GUI dibuja a 60 fps. En cada
+frame el valor mostrado se **acerca un 60%** al último recibido: `mostrado += (objetivo - mostrado) * 0.6`.
+Esto es — otra vez un concepto de la materia — un **filtro IIR de primer orden**, primo del complementario
+(§II.8): la misma idea de "mezclar lo nuevo con lo acumulado". Con datos a 50 Hz casi no hace falta
+suavizar; un α alto (0.6) responde en ~2 frames y **no agrega retardo visible** (un α bajo se vería
+"lagueado"). El punto cero **no** se suaviza: cambia por salto (botón), y verlo saltar es información.
+
+**Detalle fino del puerto:** al abrirlo se fuerzan `DTR=False, RTS=False`. Esas dos señales del puerto
+serie están cableadas al **reset/boot del ESP32** (así lo reinicia `idf.py flash`); si no se desactivaran,
+abrir el visualizador **reiniciaría el avión en pleno vuelo**. Ojo también: el puerto serie admite **un
+solo programa a la vez** — cerrar `idf.py monitor` antes de abrir el visualizador.
+
+**Cómo correrlo:**
+```bash
+sudo apt install python3-tk          # tkinter (una sola vez)
+pip install -r AirTelemetry/requirements.txt   # pyserial + Pillow
+python3 AirTelemetry/uart_attitude.py          # default /dev/ttyUSB0
+python3 AirTelemetry/attitude.py               # prueba visual sin ESP32
+```
 
 ---
 ---
@@ -902,11 +1035,14 @@ mueve menos. Y vuelta a empezar. **Eso es el lazo cerrado.**
    pitch;` → **la inclinación actual se vuelve el nuevo "nivelado"**.
 4. Desde ahí, el error del Paso 8 se mide contra ese nuevo cero.
 
-### 🟢 Flujo secundario 2 — Monitoreo (cada 200 ms)
+### 🟢 Flujo secundario 2 — Monitoreo y telemetría (`$ATT` cada 20 ms; logs cada 200 ms)
 1. `task_monitor` (prioridad 3, baja) lee el último ángulo (bajo spinlock) y el punto cero (bajo mutex).
-2. Los imprime por **UART0** con `ESP_LOGI` → los ves en la consola (`idf.py monitor`, 115200 baud). *(Ver
-   II.9.b.)*
-3. Por ser la de menor prioridad, **nunca** estorba al control.
+2. Emite la trama de telemetría **`$ATT,roll,pitch,zero_roll,zero_pitch`** con `printf` → la parsea el
+   **visualizador `AirTelemetry/`** en la PC, que dibuja el horizonte artificial con la línea del punto
+   cero. *(Ver II.9.b y §IV.5.)*
+3. Imprime además los logs humanos por **UART0** con `ESP_LOGI` → los ves en la consola (`idf.py monitor`,
+   115200 baud).
+4. Por ser la de menor prioridad, **nunca** estorba al control.
 
 ### Mapa de "quién le habla a quién"
 ```
@@ -918,11 +1054,12 @@ mueve menos. Y vuelta a empezar. **Eso es el lazo cerrado.**
                         │                                 │
                         ├── zero_roll/pitch (mutex) ──────┤   (punto cero compartido)
                         └── last_roll/pitch (spinlock) ─> task_monitor ──UART──> Consola PC
+                                                                                 + attitude indicator
 ```
 Leído en palabras: el **botón** avisa por una bandera; el **sensor** lee el MPU por I2C, filtra y manda el
 ángulo por la **cola** al **actuador**, que mueve los **servos** por PWM; en paralelo, el **monitor** lee las
-variables compartidas y las imprime por el **puerto serie**. Las líneas de mutex/spinlock son las
-protecciones para que nadie pise a nadie.
+variables compartidas y las manda por el **puerto serie**: logs para humanos y la trama `$ATT` para el
+visualizador externo. Las líneas de mutex/spinlock son las protecciones para que nadie pise a nadie.
 
 ---
 ---
@@ -975,6 +1112,11 @@ Objetivo y hardware: **sí**. Tres desviaciones deliberadas a saber justificar:
 3. **Tareas:** el anteproyecto separaba "productor (lee) / consumidor (filtra) / actuación"; en la práctica el
    sensor **lee y filtra**, el actuador **consume y mueve**, y agregamos un **monitor**. Mismo espíritu
    productor-consumidor.
+
+Además hay una **ampliación** (no una desviación): el anteproyecto pedía "enviar de forma fluida los grados
+de inclinación por la salida estándar". Lo cumplimos y lo extendimos: el monitor emite a 50 Hz la trama de
+telemetría **`$ATT`** con roll, pitch y el punto cero (ver §II.9.b) — más los logs humanos decimados a
+200 ms — para que el visualizador `AirTelemetry/` dibuje un **horizonte artificial** en la PC (§IV.5).
 
 ## VI.3 Sobre la documentación técnica previa
 
@@ -1197,6 +1339,19 @@ idf.py -p /dev/ttyUSB0 erase-flash           # borrar toda la flash (resetear es
     directo; los conceptos POSIX/µC/OS se mapean a la API de FreeRTOS.
 15. **¿Para qué sirven CMakeLists y sdkconfig.defaults?** — CMakeLists le dice a ESP-IDF qué compilar
     (obligatorio); sdkconfig.defaults fija opciones como el tick de 1 kHz. El sdkconfig grande es generado.
+16. **¿Qué es la línea `$ATT` y por qué usa `printf` en vez de `ESP_LOGI`?** — Es la trama de telemetría
+    (CSV con prefijo, estilo NMEA) que emite el monitor a 50 Hz para que un programa externo dibuje el
+    horizonte artificial. Va con `printf` para salir "limpia": sin prefijo de log, sin `°`, una línea =
+    una trama; el programa filtra por `$ATT` y hace split por comas.
+17. **¿Emitir telemetría a 50 Hz no compromete el tiempo real?** — No: es la tarea de **menor prioridad**,
+    el planificador siempre la desaloja ante el sensor/actuador. El único límite real es el ancho de banda
+    del UART (~20% usado a 115200 baudios gracias a la decimación de los logs, ver II.9.b).
+18. **¿El visualizador de la PC es parte del sistema de tiempo real?** — **No.** Corre en un SO de
+    escritorio sin garantías temporales, y no las necesita: el lazo de control cierra entero dentro del
+    ESP32. Si la PC se desconecta, el avión sigue estabilizándose. Solo observa (ver §IV.5).
+19. **¿Qué patrón usa el visualizador por dentro?** — El mismo productor-consumidor del firmware: un hilo
+    lee el puerto serie (productor) y encola con `queue.Queue`; el bucle de la GUI desencola y dibuja
+    (consumidor). Además suaviza a 60 fps con un filtro IIR de primer orden (primo del complementario).
 
 ## VIII.2 Glosario rápido
 
@@ -1226,3 +1381,15 @@ idf.py -p /dev/ttyUSB0 erase-flash           # borrar toda la flash (resetear es
 - **Glitch:** pulso deforme (ancho incorrecto); en MCPWM se evita actualizando el comparador al inicio del período.
 - **ESP_ERROR_CHECK:** macro que detiene el sistema con pánico controlado si una inicialización falla.
 - **Baud / baudios:** unidad de velocidad del puerto serie (símbolos por segundo).
+- **Telemetría:** medir en un lugar y transmitir los datos para usarlos en otro (acá, la trama `$ATT`).
+- **NMEA:** formato clásico de los GPS (`$GPGGA,...`): prefijo `$` + campos CSV, una línea por trama.
+  Inspiró nuestra trama `$ATT`.
+- **Attitude indicator (horizonte artificial):** instrumento de avión que dibuja la inclinación respecto
+  del horizonte; lo alimenta la telemetría `$ATT` con roll, pitch y punto cero (implementado en
+  `AirTelemetry/`, ver §IV.5).
+- **Suavizado exponencial:** filtro IIR de primer orden (`v += (objetivo - v) * α`) con el que el
+  visualizador interpola las tramas de 50 Hz a 60 fps.
+- **Decimación:** quedarse con 1 de cada N muestras; así los logs humanos salen cada 10 tramas (200 ms)
+  mientras la telemetría va a ritmo completo (50 Hz).
+- **DTR / RTS:** señales de control del puerto serie; en el ESP32 están cableadas al reset/boot, por eso
+  el visualizador las desactiva al abrir el puerto (para no reiniciar la placa).
